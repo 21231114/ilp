@@ -67,7 +67,7 @@ def compute_alm_loss(
     x_hat,           # [total_vars] GNN sigmoid output
     batch,           # PyG batch object
     gamma,           # current gamma
-    tau,             # tolerance
+    tau_x0,          # reference point x_0 in (0,1) for per-constraint tau_j(gamma)
     lambda_global,   # scalar global Lagrangian multiplier
     rho,             # quadratic penalty parameter
     cons_norm_cache=None,  # optional per-constraint normalization factors
@@ -76,10 +76,13 @@ def compute_alm_loss(
     """
     Compute the full Augmented Lagrangian loss.
 
+    tau_j(gamma) = K(gamma) * sqrt(u(x_0)) * sum_i |A_ji|  (per-constraint tolerance)
+
     Returns:
         loss:           total ALM loss (scalar)
         f_tilde:        margin-aware objective value (scalar)
-        xi:             [total_cons] per-constraint violation vector
+        xi:             [total_cons] per-constraint violation vector (with tau)
+        xi_no_tau:      [total_cons] violation without tau (for threshold metrics)
         max_violation:  scalar max violation
         mean_violation: scalar mean violation
         entropy_val:    scalar entropy regularization value
@@ -133,12 +136,23 @@ def compute_alm_loss(
     Ax.scatter_add_(0, cons_row, Ax_per_edge)
 
     # sum_i |A_ji| * sqrt(u_i)  for margin
-    abs_A_sqrt_u_per_edge = cons_val.abs() * sqrt_u_raw[cons_col]
+    abs_cons_val = cons_val.abs()
+    abs_A_sqrt_u_per_edge = abs_cons_val * sqrt_u_raw[cons_col]
     margin_sum = torch.zeros(n_cons, device=device)
     margin_sum.scatter_add_(0, cons_row, abs_A_sqrt_u_per_edge)
 
-    # Violation: ReLU(Ax - b + K*margin_sum - tau)
-    raw_violation = Ax - rhs + K * margin_sum - tau
+    # Raw violation without tau: ReLU(Ax - b + K*margin_sum)
+    raw_no_tau = Ax - rhs + K * margin_sum
+    xi_no_tau = torch.relu(raw_no_tau)
+
+    # Per-constraint tolerance: tau_j(gamma) = K(gamma) * sqrt(u(x_0)) * sum_i |A_ji|
+    sqrt_u_0 = math.exp(-gamma / 2.0 * (tau_x0 - 0.5) ** 2)
+    sum_abs_A = torch.zeros(n_cons, device=device)
+    sum_abs_A.scatter_add_(0, cons_row, abs_cons_val)
+    tau_vec = K * sqrt_u_0 * sum_abs_A
+
+    # Violation with tolerance: ReLU(Ax - b + K*margin_sum - tau_j)
+    raw_violation = raw_no_tau - tau_vec
 
     # Optional: normalize by constraint scale for balanced penalties
     if cons_norm_cache is not None:
@@ -168,7 +182,7 @@ def compute_alm_loss(
     max_violation = xi.max().item() if xi.numel() > 0 else 0.0
     mean_violation = xi.mean().item() if xi.numel() > 0 else 0.0
 
-    return loss, f_tilde.item(), xi, max_violation, mean_violation, entropy_val.item()
+    return loss, f_tilde.item(), xi, xi_no_tau, max_violation, mean_violation, entropy_val.item()
 
 
 def compute_constraint_norms(batch, device):
@@ -287,7 +301,8 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
                 gamma, tau, lambda_global, rho, prev_violation,
                 inner_steps, beta, rho_max, gamma_max, delta_gamma,
                 entropy_weight, cons_normalize, grad_clip_norm,
-                device, step_counter):
+                device, step_counter,
+                freeze_lambda=False, freeze_gamma=False, freeze_rho=False):
     """
     One epoch of ALM training with inner/outer loop.
 
@@ -301,6 +316,8 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
     total_max_viol = 0.0
     total_mean_viol = 0.0
     total_entropy = 0.0
+    total_xi_sum = 0.0
+    total_num_graphs = 0
     n_batches = 0
 
     for batch in data_loader:
@@ -333,7 +350,7 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         x_hat = logits.sigmoid()
 
         # --- Compute ALM loss ---
-        loss, f_tilde, xi, max_viol, mean_viol, ent_val = compute_alm_loss(
+        loss, f_tilde, xi, xi_no_tau, max_viol, mean_viol, ent_val = compute_alm_loss(
             x_hat, batch, gamma, tau, lambda_global, rho,
             cons_norm_cache=cons_norm,
             entropy_weight=entropy_weight,
@@ -361,6 +378,8 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         total_max_viol += max_viol
         total_mean_viol += mean_viol
         total_entropy += ent_val
+        total_xi_sum += xi_no_tau.sum().item()
+        total_num_graphs += batch.num_graphs
         n_batches += 1
         step_counter += 1
 
@@ -369,21 +388,26 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
             with torch.no_grad():
                 curr_viol = xi.sum().item() / max(batch.num_graphs, 1)
                 # Update global lambda
-                lambda_global = max(0.0, lambda_global + rho * curr_viol)
+                if not freeze_lambda:
+                    lambda_global = max(0.0, lambda_global + rho * curr_viol)
                 # Update rho if violations aren't decreasing fast enough
-                if curr_viol > 0.8 * prev_violation and curr_viol > 1e-4:
-                    rho = min(rho * beta, rho_max)
+                if not freeze_rho:
+                    if curr_viol > 0.8 * prev_violation and curr_viol > 1e-4:
+                        rho = min(rho * beta, rho_max)
                 # Gamma annealing
-                gamma = min(gamma + delta_gamma, gamma_max)
+                if not freeze_gamma:
+                    gamma = min(gamma + delta_gamma, gamma_max)
                 prev_violation = curr_viol
 
     n_batches = max(n_batches, 1)
+    total_num_graphs = max(total_num_graphs, 1)
     metrics = {
         'loss_total': total_loss / n_batches,
         'objective_margin': total_f_tilde / n_batches,
         'max_violation': total_max_viol / n_batches,
         'mean_violation': total_mean_viol / n_batches,
         'entropy': total_entropy / n_batches,
+        'xi_sum_per_sample': total_xi_sum / total_num_graphs,
         'gamma': gamma,
         'rho': rho,
         'lambda_global': lambda_global,
@@ -409,6 +433,8 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
     total_discrete_obj = 0.0
     total_polarization = 0.0
     total_uncertainty = 0.0
+    total_xi_sum = 0.0
+    total_num_graphs = 0
     n_batches = 0
 
     for batch in data_loader:
@@ -438,7 +464,7 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         )
         x_hat = logits.sigmoid()
 
-        loss, f_tilde, xi, max_viol, mean_viol, _ = compute_alm_loss(
+        loss, f_tilde, xi, xi_no_tau, max_viol, mean_viol, _ = compute_alm_loss(
             x_hat, batch, gamma, tau, lambda_global, rho,
             cons_norm_cache=cons_norm,
             entropy_weight=entropy_weight,
@@ -456,9 +482,12 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         total_discrete_obj += disc_obj
         total_polarization += polar
         total_uncertainty += uncert
+        total_xi_sum += xi_no_tau.sum().item()
+        total_num_graphs += batch.num_graphs
         n_batches += 1
 
     n_batches = max(n_batches, 1)
+    total_num_graphs = max(total_num_graphs, 1)
     metrics = {
         'loss_total': total_loss / n_batches,
         'objective_margin': total_f_tilde / n_batches,
@@ -468,6 +497,8 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         'discrete_objective': total_discrete_obj / n_batches,
         'polarization_rate': total_polarization / n_batches,
         'mean_uncertainty': total_uncertainty / n_batches,
+        'xi_sum_per_sample': total_xi_sum / total_num_graphs,
+        'objective_per_sample': total_discrete_obj / total_num_graphs,
     }
     return metrics
 
@@ -484,6 +515,7 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed):
         f"Obj_margin={train_metrics['objective_margin']:.4f}  "
         f"MaxViol={train_metrics['max_violation']:.6f}  "
         f"MeanViol={train_metrics['mean_violation']:.6f}  "
+        f"XiSum/s={train_metrics['xi_sum_per_sample']:.6f}  "
         f"Entropy={train_metrics['entropy']:.4f}",
         f"  [ALM]   gamma={train_metrics['gamma']:.2f}  "
         f"rho={train_metrics['rho']:.4f}  "
@@ -494,7 +526,9 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed):
         lines.append(
             f"  [Valid] Loss={val_metrics['loss_total']:.6f}  "
             f"MaxViol={val_metrics['max_violation']:.6f}  "
-            f"MeanViol={val_metrics['mean_violation']:.6f}"
+            f"MeanViol={val_metrics['mean_violation']:.6f}  "
+            f"XiSum/s={val_metrics['xi_sum_per_sample']:.6f}  "
+            f"AvgObj/s={val_metrics['objective_per_sample']:.4f}"
         )
         lines.append(
             f"  [Disc]  Feasibility={val_metrics['feasibility_rate']:.4f}  "
@@ -534,6 +568,8 @@ def log_to_tensorboard(writer, train_metrics, val_metrics, epoch):
         writer.add_scalar('Loss/Valid_Total', val_metrics['loss_total'], epoch)
         writer.add_scalar('Violation/Valid_Max', val_metrics['max_violation'], epoch)
         writer.add_scalar('Violation/Valid_Mean', val_metrics['mean_violation'], epoch)
+        writer.add_scalar('Violation/Valid_XiSum_PerSample', val_metrics['xi_sum_per_sample'], epoch)
+        writer.add_scalar('Objective/Valid_PerSample', val_metrics['objective_per_sample'], epoch)
 
         # Discrete ground truth
         writer.add_scalar('Discrete/Feasibility_Rate', val_metrics['feasibility_rate'], epoch)
@@ -572,7 +608,8 @@ def get_parser():
 
     # ALM hyperparameters
     parser.add_argument("--tau", type=float, default=0.9,
-                        help="Constraint tolerance (default: %(default)s)")
+                        help="Reference point x_0 for per-constraint tolerance "
+                             "tau_j(gamma) = K(gamma)*sqrt(u(x_0))*sum|A_ji| (default: %(default)s)")
     parser.add_argument("--gamma_init", type=float, default=1.0,
                         help="Initial state sharpness (default: %(default)s)")
     parser.add_argument("--gamma_max", type=float, default=50.0,
@@ -624,8 +661,23 @@ def get_parser():
     parser.add_argument("--device", default="cuda:0")
 
     # Validation frequency
-    parser.add_argument("--val_every", type=int, default=5,
+    parser.add_argument("--val_every", type=int, default=1,
                         help="Validate every N epochs (default: %(default)s)")
+
+    # Early stopping
+    parser.add_argument("--es_xi_threshold", type=float, default=1.0,
+                        help="Early-stop feasibility threshold: avg sum_j xi_j per sample (default: %(default)s)")
+    parser.add_argument("--patience", type=int, default=50,
+                        help="Early-stop patience: epochs without improvement (default: %(default)s)")
+
+    # ALM freezing: freeze lambda (and optionally gamma/rho) when xi_sum < threshold2
+    parser.add_argument("--es_xi_threshold2", type=float, default=None,
+                        help="When valid xi_sum/sample < this, freeze lambda. "
+                             "None = disabled (default: %(default)s)")
+    parser.add_argument("--freeze_gamma_on_feasible", action='store_true', default=False,
+                        help="Also freeze gamma when xi_sum < es_xi_threshold2")
+    parser.add_argument("--freeze_rho_on_feasible", action='store_true', default=False,
+                        help="Also freeze rho when xi_sum < es_xi_threshold2")
 
     return parser
 
@@ -771,8 +823,11 @@ def main():
             print("  Loaded model weights (no optimizer/ALM state). Training from epoch 0.")
 
     # ---- Training ----
-    best_val_feasibility = 0.0
-    best_val_loss = float('inf')
+    best_val_xi_sum = float('inf')
+    best_val_obj = float('inf')
+    best_feasible = False  # whether best model satisfies xi threshold
+    patience_counter = 0
+    alm_frozen = False  # whether ALM params are frozen due to es_xi_threshold2
 
     print(f"\n{'='*70}")
     print(f"Starting Unsupervised ALM Training for {problem_type}")
@@ -786,12 +841,16 @@ def main():
         t0 = time.time()
 
         # Train
+        freeze_lambda = alm_frozen
+        freeze_gamma = alm_frozen and args.freeze_gamma_on_feasible
+        freeze_rho = alm_frozen and args.freeze_rho_on_feasible
         gamma, lambda_global, rho, prev_violation, step_counter, train_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, ema,
             gamma, args.tau, lambda_global, rho, prev_violation,
             args.inner_steps, args.beta, args.rho_max, args.gamma_max, args.delta_gamma,
             args.entropy_weight, args.cons_normalize, args.grad_clip_norm,
             device, step_counter,
+            freeze_lambda=freeze_lambda, freeze_gamma=freeze_gamma, freeze_rho=freeze_rho,
         )
 
         # Validate periodically
@@ -811,22 +870,50 @@ def main():
                 ema.restore(model, backup)
 
             # Save best model
-            # Primary: best feasibility; secondary: best loss among feasible
+            # Primary: xi_sum below threshold → feasible; secondary: lowest objective
+            curr_xi = val_metrics['xi_sum_per_sample']
+            curr_obj = val_metrics['objective_per_sample']
+            curr_feasible = curr_xi < args.es_xi_threshold
+
             is_best = False
-            if val_metrics['feasibility_rate'] > best_val_feasibility + 1e-4:
-                best_val_feasibility = val_metrics['feasibility_rate']
+            if curr_feasible and not best_feasible:
+                # First time becoming feasible — always save
                 is_best = True
-            elif (abs(val_metrics['feasibility_rate'] - best_val_feasibility) < 1e-4
-                  and val_metrics['loss_total'] < best_val_loss):
-                best_val_loss = val_metrics['loss_total']
-                is_best = True
+            elif curr_feasible and best_feasible:
+                # Both feasible — save if objective improved
+                if curr_obj < best_val_obj - 1e-6:
+                    is_best = True
+            elif not curr_feasible and not best_feasible:
+                # Neither feasible — save if xi_sum improved
+                if curr_xi < best_val_xi_sum - 1e-6:
+                    is_best = True
 
             if is_best:
+                best_feasible = curr_feasible
+                best_val_xi_sum = curr_xi
+                best_val_obj = curr_obj
+                patience_counter = 0
                 save_state = ema.shadow if ema is not None else model.state_dict()
                 if isinstance(save_state, dict) and all(isinstance(v, torch.Tensor) for v in save_state.values()):
                     torch.save(save_state, os.path.join(model_save_path, f'{save_name}_model_best.pth'))
                 else:
                     torch.save(model.state_dict(), os.path.join(model_save_path, f'{save_name}_model_best.pth'))
+            else:
+                patience_counter += 1
+
+            # Check ALM freeze condition
+            if (not alm_frozen
+                    and args.es_xi_threshold2 is not None
+                    and curr_xi < args.es_xi_threshold2):
+                alm_frozen = True
+                frozen_parts = ["lambda"]
+                if args.freeze_gamma_on_feasible:
+                    frozen_parts.append("gamma")
+                if args.freeze_rho_on_feasible:
+                    frozen_parts.append("rho")
+                print(f"  [Freeze] xi_sum/sample={curr_xi:.6f} < threshold2={args.es_xi_threshold2} "
+                      f"=> freezing {', '.join(frozen_parts)} "
+                      f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
 
         # Save latest (full checkpoint for resumable training)
         full_ckpt = {
@@ -853,12 +940,14 @@ def main():
 
         log_to_tensorboard(tb_writer, train_metrics, val_metrics, epoch)
 
-        # Early stopping: if feasibility is 100% and violations are near zero
+        # Early stopping based on patience
         if (val_metrics is not None
-                and val_metrics['feasibility_rate'] >= 0.9999
-                and val_metrics['max_violation'] < 1e-4
-                and epoch > 100):
-            print(f"\nEarly stopping at epoch {epoch}: 100% feasibility achieved!")
+                and patience_counter >= args.patience
+                and epoch > args.patience):
+            print(f"\nEarly stopping at epoch {epoch}: no improvement for {args.patience} epochs.")
+            print(f"  Best XiSum/sample={best_val_xi_sum:.6f}  "
+                  f"Best AvgObj/sample={best_val_obj:.4f}  "
+                  f"Feasible={best_feasible}")
             break
 
     log_file.close()
