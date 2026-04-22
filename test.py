@@ -167,9 +167,9 @@ def solve_mps(mps_file, log_dir, save_name, ins_name, scores, task, args):
 
 
 
-def compute_rounded_violations_gurobi(instance_path, var_names, rounded_values):
+def compute_rounded_violations(instance_path, var_names, rounded_values):
     """
-    加载实例，代入四舍五入后的解，计算目标值和约束违反量（不调用 optimize()）。
+    加载实例（pyscipopt），代入四舍五入后的解，计算目标值和约束违反量。
 
     Returns
     -------
@@ -179,51 +179,62 @@ def compute_rounded_violations_gurobi(instance_path, var_names, rounded_values):
     n_violated: int    — 违反约束数
     n_total   : int    — 约束总数
     """
-    import gurobipy as gp
+    import pyscipopt as scp
 
-    env = gp.Env(empty=True)
-    env.setParam('OutputFlag', 0)
-    env.start()
-    grb_model = gp.read(instance_path, env)
-    grb_model.update()
+    m = scp.Model()
+    m.hideOutput(True)
+    m.readProblem(instance_path)
 
-    grb_vars = grb_model.getVars()
-    constrs  = grb_model.getConstrs()
-    name2idx = {v.VarName: i for i, v in enumerate(grb_vars)}
+    mvars = m.getVars()
+    mvars.sort(key=lambda v: v.name)
+    name2idx = {v.name: i for i, v in enumerate(mvars)}
 
-    # 构建解向量（按 Gurobi 变量顺序）
-    x = np.zeros(len(grb_vars))
+    # 构建解向量（按 pyscipopt 变量顺序）
+    x = np.zeros(len(mvars))
     for name, val in zip(var_names, rounded_values):
         gname = name[2:] if (name.startswith('t_') and name not in name2idx) else name
         if gname in name2idx:
             x[name2idx[gname]] = float(val)
 
     # 目标值
-    obj_coeffs = np.array([v.Obj for v in grb_vars])
-    obj_val = float(np.dot(obj_coeffs, x))
+    obj = m.getObjective()
+    obj_val = 0.0
+    for e in obj:
+        vnm = e.vartuple[0].name
+        if vnm in name2idx:
+            obj_val += obj[e] * x[name2idx[vnm]]
 
     # 约束违反量
-    A  = grb_model.getA()                      # scipy sparse (n_cons × n_vars)
-    Ax = np.asarray(A @ x).flatten()
-    b  = np.array([c.RHS   for c in constrs])
-    senses = [c.Sense for c in constrs]
+    cons = m.getConss()
+    cons = [c for c in cons if len(m.getValsLinear(c)) > 0]
 
-    viol = np.zeros(len(constrs))
-    for i, (sense, ax_i, b_i) in enumerate(zip(senses, Ax, b)):
-        if sense == '<':
-            viol[i] = max(0.0, ax_i - b_i)
-        elif sense == '>':
-            viol[i] = max(0.0, b_i - ax_i)
-        else:                                   # '='
-            viol[i] = abs(ax_i - b_i)
+    viol_list = []
+    for c in cons:
+        coeff = m.getValsLinear(c)
+        rhs_val = m.getRhs(c)
+        lhs_val = m.getLhs(c)
 
-    grb_model.dispose()
-    env.dispose()
+        # Compute A_j @ x
+        ax = sum(coeff[k] * x[name2idx[k]] for k in coeff if k in name2idx)
 
-    max_v  = float(viol.max())  if len(viol) > 0 else 0.0
-    mean_v = float(viol.mean()) if len(viol) > 0 else 0.0
+        if rhs_val == lhs_val:
+            # Equality
+            viol_list.append(abs(ax - rhs_val))
+        elif rhs_val >= 1e+20:
+            # >= constraint
+            viol_list.append(max(0.0, lhs_val - ax))
+        else:
+            # <= constraint
+            viol_list.append(max(0.0, ax - rhs_val))
+
+    viol = np.array(viol_list) if len(viol_list) > 0 else np.array([0.0])
+
+    m.freeProb()
+
+    max_v  = float(viol.max())
+    mean_v = float(viol.mean())
     n_viol = int((viol > 1e-6).sum())
-    return obj_val, max_v, mean_v, n_viol, len(constrs)
+    return obj_val, max_v, mean_v, n_viol, len(viol_list)
 
 
 def load_solution(sol_path):
@@ -546,8 +557,8 @@ def run_unsupervised_eval(args, policy):
         # Round
         BD_rounded = torch.round(BD).numpy()
 
-        # Evaluate using Gurobi
-        obj_val, max_v, mean_v, n_viol, n_total = compute_rounded_violations_gurobi(
+        # Evaluate constraint violations (pyscipopt)
+        obj_val, max_v, mean_v, n_viol, n_total = compute_rounded_violations(
             ins_path, all_varname, BD_rounded
         )
 

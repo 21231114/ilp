@@ -51,7 +51,7 @@ def compute_K(gamma, K_max=10.0):
         return 0.5
     x_star = 0.75 + 0.5 * math.sqrt(disc)
     K = (1.0 - x_star) * math.exp(gamma / 2.0 * (x_star - 0.5) ** 2)
-    return min(K, K_max)
+    return K
 
 
 def compute_state_uncertainty(x_hat, gamma):
@@ -182,7 +182,7 @@ def compute_alm_loss(
     max_violation = xi.max().item() if xi.numel() > 0 else 0.0
     mean_violation = xi.mean().item() if xi.numel() > 0 else 0.0
 
-    return loss, f_tilde.item(), xi, xi_no_tau, max_violation, mean_violation, entropy_val.item()
+    return loss, f_tilde.item(), xi, xi_no_tau, max_violation, mean_violation, entropy_val.item(), tau_vec
 
 
 def compute_constraint_norms(batch, device):
@@ -318,6 +318,10 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
     total_entropy = 0.0
     total_xi_sum = 0.0
     total_num_graphs = 0
+    total_pred0_ratio = 0.0
+    total_pred1_ratio = 0.0
+    total_xi_mean_per_cons = 0.0
+    total_tau_mean = 0.0
     n_batches = 0
 
     for batch in data_loader:
@@ -350,7 +354,7 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         x_hat = logits.sigmoid()
 
         # --- Compute ALM loss ---
-        loss, f_tilde, xi, xi_no_tau, max_viol, mean_viol, ent_val = compute_alm_loss(
+        loss, f_tilde, xi, xi_no_tau, max_viol, mean_viol, ent_val, tau_vec = compute_alm_loss(
             x_hat, batch, gamma, tau, lambda_global, rho,
             cons_norm_cache=cons_norm,
             entropy_weight=entropy_weight,
@@ -380,6 +384,17 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         total_entropy += ent_val
         total_xi_sum += xi_no_tau.sum().item()
         total_num_graphs += batch.num_graphs
+
+        # Predicted 0/1 ratio
+        with torch.no_grad():
+            x_rounded = torch.round(x_hat)
+            total_pred0_ratio += (x_rounded == 0).float().mean().item()
+            total_pred1_ratio += (x_rounded == 1).float().mean().item()
+            # Mean xi_j per constraint (average across constraints)
+            total_xi_mean_per_cons += (xi_no_tau.sum().item() / max(xi_no_tau.numel(), 1))
+            # Mean tau_j
+            total_tau_mean += tau_vec.mean().item()
+
         n_batches += 1
         step_counter += 1
 
@@ -408,6 +423,10 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         'mean_violation': total_mean_viol / n_batches,
         'entropy': total_entropy / n_batches,
         'xi_sum_per_sample': total_xi_sum / total_num_graphs,
+        'pred0_ratio': total_pred0_ratio / n_batches,
+        'pred1_ratio': total_pred1_ratio / n_batches,
+        'xi_mean_per_cons': total_xi_mean_per_cons / n_batches,
+        'tau_mean': total_tau_mean / n_batches,
         'gamma': gamma,
         'rho': rho,
         'lambda_global': lambda_global,
@@ -435,6 +454,10 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
     total_uncertainty = 0.0
     total_xi_sum = 0.0
     total_num_graphs = 0
+    total_pred0_ratio = 0.0
+    total_pred1_ratio = 0.0
+    total_xi_mean_per_cons = 0.0
+    total_tau_mean = 0.0
     n_batches = 0
 
     for batch in data_loader:
@@ -464,7 +487,7 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         )
         x_hat = logits.sigmoid()
 
-        loss, f_tilde, xi, xi_no_tau, max_viol, mean_viol, _ = compute_alm_loss(
+        loss, f_tilde, xi, xi_no_tau, max_viol, mean_viol, _, tau_vec = compute_alm_loss(
             x_hat, batch, gamma, tau, lambda_global, rho,
             cons_norm_cache=cons_norm,
             entropy_weight=entropy_weight,
@@ -484,6 +507,16 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         total_uncertainty += uncert
         total_xi_sum += xi_no_tau.sum().item()
         total_num_graphs += batch.num_graphs
+
+        # Predicted 0/1 ratio
+        x_rounded = torch.round(x_hat)
+        total_pred0_ratio += (x_rounded == 0).float().mean().item()
+        total_pred1_ratio += (x_rounded == 1).float().mean().item()
+        # Mean xi_j per constraint
+        total_xi_mean_per_cons += (xi_no_tau.sum().item() / max(xi_no_tau.numel(), 1))
+        # Mean tau_j
+        total_tau_mean += tau_vec.mean().item()
+
         n_batches += 1
 
     n_batches = max(n_batches, 1)
@@ -499,6 +532,10 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         'mean_uncertainty': total_uncertainty / n_batches,
         'xi_sum_per_sample': total_xi_sum / total_num_graphs,
         'objective_per_sample': total_discrete_obj / total_num_graphs,
+        'pred0_ratio': total_pred0_ratio / n_batches,
+        'pred1_ratio': total_pred1_ratio / n_batches,
+        'xi_mean_per_cons': total_xi_mean_per_cons / n_batches,
+        'tau_mean': total_tau_mean / n_batches,
     }
     return metrics
 
@@ -517,6 +554,10 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed):
         f"MeanViol={train_metrics['mean_violation']:.6f}  "
         f"XiSum/s={train_metrics['xi_sum_per_sample']:.6f}  "
         f"Entropy={train_metrics['entropy']:.4f}",
+        f"  [Pred]  Pred0={train_metrics['pred0_ratio']:.4f}  "
+        f"Pred1={train_metrics['pred1_ratio']:.4f}  "
+        f"Xi_mean/cons={train_metrics['xi_mean_per_cons']:.6f}  "
+        f"Tau_mean={train_metrics['tau_mean']:.6f}",
         f"  [ALM]   gamma={train_metrics['gamma']:.2f}  "
         f"rho={train_metrics['rho']:.4f}  "
         f"lambda={train_metrics['lambda_global']:.4f}  "
@@ -529,6 +570,12 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed):
             f"MeanViol={val_metrics['mean_violation']:.6f}  "
             f"XiSum/s={val_metrics['xi_sum_per_sample']:.6f}  "
             f"AvgObj/s={val_metrics['objective_per_sample']:.4f}"
+        )
+        lines.append(
+            f"  [VPred] Pred0={val_metrics['pred0_ratio']:.4f}  "
+            f"Pred1={val_metrics['pred1_ratio']:.4f}  "
+            f"Xi_mean/cons={val_metrics['xi_mean_per_cons']:.6f}  "
+            f"Tau_mean={val_metrics['tau_mean']:.6f}"
         )
         lines.append(
             f"  [Disc]  Feasibility={val_metrics['feasibility_rate']:.4f}  "
@@ -564,6 +611,12 @@ def log_to_tensorboard(writer, train_metrics, val_metrics, epoch):
     writer.add_scalar('ALM/Lambda_Global', train_metrics['lambda_global'], epoch)
     writer.add_scalar('ALM/K_gamma', train_metrics['K_gamma'], epoch)
 
+    # New metrics
+    writer.add_scalar('Prediction/Pred0_Ratio', train_metrics['pred0_ratio'], epoch)
+    writer.add_scalar('Prediction/Pred1_Ratio', train_metrics['pred1_ratio'], epoch)
+    writer.add_scalar('Violation/Xi_Mean_PerCons', train_metrics['xi_mean_per_cons'], epoch)
+    writer.add_scalar('ALM/Tau_Mean', train_metrics['tau_mean'], epoch)
+
     if val_metrics:
         writer.add_scalar('Loss/Valid_Total', val_metrics['loss_total'], epoch)
         writer.add_scalar('Violation/Valid_Max', val_metrics['max_violation'], epoch)
@@ -576,6 +629,12 @@ def log_to_tensorboard(writer, train_metrics, val_metrics, epoch):
         writer.add_scalar('Discrete/Objective', val_metrics['discrete_objective'], epoch)
         writer.add_scalar('State/Polarization_Rate', val_metrics['polarization_rate'], epoch)
         writer.add_scalar('State/Mean_Uncertainty', val_metrics['mean_uncertainty'], epoch)
+
+        # Validation new metrics
+        writer.add_scalar('Prediction/Valid_Pred0_Ratio', val_metrics['pred0_ratio'], epoch)
+        writer.add_scalar('Prediction/Valid_Pred1_Ratio', val_metrics['pred1_ratio'], epoch)
+        writer.add_scalar('Violation/Valid_Xi_Mean_PerCons', val_metrics['xi_mean_per_cons'], epoch)
+        writer.add_scalar('ALM/Valid_Tau_Mean', val_metrics['tau_mean'], epoch)
 
 
 # ============================================================
@@ -884,6 +943,7 @@ def main():
                 if curr_obj < best_val_obj - 1e-6:
                     is_best = True
             elif not curr_feasible and not best_feasible:
+                
                 # Neither feasible — save if xi_sum improved
                 if curr_xi < best_val_xi_sum - 1e-6:
                     is_best = True

@@ -9,9 +9,6 @@ import torch
 import torch.nn as nn
 import pickle
 
-import gurobipy as gp
-from gurobipy import GRB
-
 
 device=torch.device("cpu")
 
