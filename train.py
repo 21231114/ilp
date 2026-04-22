@@ -72,6 +72,7 @@ def compute_alm_loss(
     rho,             # quadratic penalty parameter
     cons_norm_cache=None,  # optional per-constraint normalization factors
     entropy_weight=0.0,    # binary entropy regularization weight
+    tau_min=None,    # minimum value for tau_j(gamma); clamp tau_vec to this floor
 ):
     """
     Compute the full Augmented Lagrangian loss.
@@ -145,11 +146,18 @@ def compute_alm_loss(
     raw_no_tau = Ax - rhs + K * margin_sum
     xi_no_tau = torch.relu(raw_no_tau)
 
+    # Raw violation without margin and tau: ReLU(Ax - b)
+    xi_raw = torch.relu(Ax - rhs)
+
     # Per-constraint tolerance: tau_j(gamma) = K(gamma) * sqrt(u(x_0)) * sum_i |A_ji|
     sqrt_u_0 = math.exp(-gamma / 2.0 * (tau_x0 - 0.5) ** 2)
     sum_abs_A = torch.zeros(n_cons, device=device)
     sum_abs_A.scatter_add_(0, cons_row, abs_cons_val)
     tau_vec = K * sqrt_u_0 * sum_abs_A
+
+    # Clamp tau_vec to tau_min floor
+    if tau_min is not None:
+        tau_vec = torch.clamp(tau_vec, min=tau_min)
 
     # Violation with tolerance: ReLU(Ax - b + K*margin_sum - tau_j)
     raw_violation = raw_no_tau - tau_vec
@@ -182,7 +190,7 @@ def compute_alm_loss(
     max_violation = xi.max().item() if xi.numel() > 0 else 0.0
     mean_violation = xi.mean().item() if xi.numel() > 0 else 0.0
 
-    return loss, f_tilde.item(), xi, xi_no_tau, max_violation, mean_violation, entropy_val.item(), tau_vec
+    return loss, f_tilde.item(), f_base.item(), xi, xi_no_tau, xi_raw, max_violation, mean_violation, entropy_val.item(), tau_vec
 
 
 def compute_constraint_norms(batch, device):
@@ -212,6 +220,9 @@ def evaluate_discrete(x_hat, batch, device):
         discrete_obj:     c^T * round(x_hat) (raw objective, not margin-aware)
         polarization_rate: fraction of variables near 0 or 1
         mean_uncertainty:  mean of u_i
+        avg_violation_per_instance: average sum of ReLU(Ax-b) per instance
+        n_feasible_instances: number of instances where ALL constraints are satisfied
+        n_infeasible_instances: number of instances with at least one violated constraint
     """
     # Map to raw order
     gnn_to_raw = batch.gnn_to_raw_map.to(device)
@@ -246,6 +257,27 @@ def evaluate_discrete(x_hat, batch, device):
     satisfied = (violations <= 1e-6).float()
     feasibility_rate = satisfied.mean().item() if n_cons > 0 else 1.0
 
+    # Per-instance violation and feasibility
+    violation_per_cons = torch.relu(violations)
+    n_instances = batch.num_graphs
+    raw_n_cons_tensor = batch.raw_n_cons.long().to(device) if torch.is_tensor(batch.raw_n_cons) else torch.tensor([batch.raw_n_cons], device=device).long()
+    raw_cons_batch = torch.repeat_interleave(
+        torch.arange(n_instances, device=device),
+        raw_n_cons_tensor,
+    )
+
+    # Sum of violations per instance
+    violation_per_instance = torch.zeros(n_instances, device=device)
+    violation_per_instance.scatter_add_(0, raw_cons_batch, violation_per_cons)
+    avg_violation_per_instance = violation_per_instance.mean().item()
+
+    # Count violated constraints per instance
+    violated_flags = (violations > 1e-6).float()
+    violated_per_instance = torch.zeros(n_instances, device=device)
+    violated_per_instance.scatter_add_(0, raw_cons_batch, violated_flags)
+    n_feasible_instances = (violated_per_instance == 0).sum().item()
+    n_infeasible_instances = n_instances - n_feasible_instances
+
     # Polarization rate: |x_hat - 0.5| > 0.45 (i.e., x < 0.05 or x > 0.95)
     polarized = ((x_hat < 0.05) | (x_hat > 0.95)).float()
     polarization_rate = polarized.mean().item()
@@ -254,7 +286,8 @@ def evaluate_discrete(x_hat, batch, device):
     # We don't have gamma here, so use a simple measure
     mean_uncertainty = (4 * x_hat * (1 - x_hat)).mean().item()  # max at 0.5, 0 at 0/1
 
-    return feasibility_rate, discrete_obj, polarization_rate, mean_uncertainty
+    return (feasibility_rate, discrete_obj, polarization_rate, mean_uncertainty,
+            avg_violation_per_instance, n_feasible_instances, n_infeasible_instances)
 
 
 # ============================================================
@@ -302,7 +335,8 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
                 inner_steps, beta, rho_max, gamma_max, delta_gamma,
                 entropy_weight, cons_normalize, grad_clip_norm,
                 device, step_counter,
-                freeze_lambda=False, freeze_gamma=False, freeze_rho=False):
+                freeze_lambda=False, freeze_gamma=False, freeze_rho=False,
+                tau_min=None):
     """
     One epoch of ALM training with inner/outer loop.
 
@@ -313,15 +347,23 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
     # Accumulators for epoch-level metrics
     total_loss = 0.0
     total_f_tilde = 0.0
+    total_f_base = 0.0
     total_max_viol = 0.0
     total_mean_viol = 0.0
     total_entropy = 0.0
     total_xi_sum = 0.0
+    total_xi_with_tau_sum = 0.0
+    total_xi_raw_sum = 0.0
     total_num_graphs = 0
     total_pred0_ratio = 0.0
     total_pred1_ratio = 0.0
     total_xi_mean_per_cons = 0.0
     total_tau_mean = 0.0
+    # Discrete metrics accumulators
+    total_discrete_obj = 0.0
+    total_discrete_viol = 0.0
+    total_feasible_inst = 0
+    total_infeasible_inst = 0
     n_batches = 0
 
     for batch in data_loader:
@@ -354,10 +396,11 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         x_hat = logits.sigmoid()
 
         # --- Compute ALM loss ---
-        loss, f_tilde, xi, xi_no_tau, max_viol, mean_viol, ent_val, tau_vec = compute_alm_loss(
+        loss, f_tilde, f_base, xi, xi_no_tau, xi_raw, max_viol, mean_viol, ent_val, tau_vec = compute_alm_loss(
             x_hat, batch, gamma, tau, lambda_global, rho,
             cons_norm_cache=cons_norm,
             entropy_weight=entropy_weight,
+            tau_min=tau_min,
         )
 
         # Normalize by number of graphs in batch
@@ -379,13 +422,16 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         # --- Accumulate metrics ---
         total_loss += loss.item()
         total_f_tilde += f_tilde
+        total_f_base += f_base
         total_max_viol += max_viol
         total_mean_viol += mean_viol
         total_entropy += ent_val
         total_xi_sum += xi_no_tau.sum().item()
+        total_xi_with_tau_sum += xi.sum().item()
+        total_xi_raw_sum += xi_raw.sum().item()
         total_num_graphs += batch.num_graphs
 
-        # Predicted 0/1 ratio
+        # Predicted 0/1 ratio and discrete evaluation
         with torch.no_grad():
             x_rounded = torch.round(x_hat)
             total_pred0_ratio += (x_rounded == 0).float().mean().item()
@@ -394,6 +440,13 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
             total_xi_mean_per_cons += (xi_no_tau.sum().item() / max(xi_no_tau.numel(), 1))
             # Mean tau_j
             total_tau_mean += tau_vec.mean().item()
+
+            # Discrete evaluation
+            feas, disc_obj, _, _, avg_viol_inst, n_feas, n_infeas = evaluate_discrete(x_hat, batch, device)
+            total_discrete_obj += disc_obj
+            total_discrete_viol += avg_viol_inst * batch.num_graphs
+            total_feasible_inst += n_feas
+            total_infeasible_inst += n_infeas
 
         n_batches += 1
         step_counter += 1
@@ -431,6 +484,17 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         'rho': rho,
         'lambda_global': lambda_global,
         'K_gamma': compute_K(gamma),
+        # Per-instance continuous metrics
+        'obj_margin_per_inst': total_f_tilde / total_num_graphs,
+        'obj_raw_per_inst': total_f_base / total_num_graphs,
+        'xi_margin_tau_per_inst': total_xi_with_tau_sum / total_num_graphs,
+        'xi_raw_per_inst': total_xi_raw_sum / total_num_graphs,
+        'xi_margin_per_inst': total_xi_sum / total_num_graphs,
+        # Per-instance discrete metrics
+        'disc_obj_per_inst': total_discrete_obj / total_num_graphs,
+        'disc_viol_per_inst': total_discrete_viol / total_num_graphs,
+        'n_feasible_inst': total_feasible_inst,
+        'n_infeasible_inst': total_infeasible_inst,
     }
 
     return gamma, lambda_global, rho, prev_violation, step_counter, metrics
@@ -438,7 +502,7 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
 
 @torch.no_grad()
 def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
-                   entropy_weight, cons_normalize, device):
+                   entropy_weight, cons_normalize, device, tau_min=None):
     """
     Validate: compute ALM loss + discrete rounding metrics.
     """
@@ -446,6 +510,7 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
 
     total_loss = 0.0
     total_f_tilde = 0.0
+    total_f_base = 0.0
     total_max_viol = 0.0
     total_mean_viol = 0.0
     total_feasibility = 0.0
@@ -453,11 +518,17 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
     total_polarization = 0.0
     total_uncertainty = 0.0
     total_xi_sum = 0.0
+    total_xi_with_tau_sum = 0.0
+    total_xi_raw_sum = 0.0
     total_num_graphs = 0
     total_pred0_ratio = 0.0
     total_pred1_ratio = 0.0
     total_xi_mean_per_cons = 0.0
     total_tau_mean = 0.0
+    # Per-instance discrete metrics
+    total_discrete_viol = 0.0
+    total_feasible_inst = 0
+    total_infeasible_inst = 0
     n_batches = 0
 
     for batch in data_loader:
@@ -487,18 +558,20 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         )
         x_hat = logits.sigmoid()
 
-        loss, f_tilde, xi, xi_no_tau, max_viol, mean_viol, _, tau_vec = compute_alm_loss(
+        loss, f_tilde, f_base, xi, xi_no_tau, xi_raw, max_viol, mean_viol, _, tau_vec = compute_alm_loss(
             x_hat, batch, gamma, tau, lambda_global, rho,
             cons_norm_cache=cons_norm,
             entropy_weight=entropy_weight,
+            tau_min=tau_min,
         )
         loss = loss / max(batch.num_graphs, 1)
 
         # Discrete evaluation
-        feas, disc_obj, polar, uncert = evaluate_discrete(x_hat, batch, device)
+        feas, disc_obj, polar, uncert, avg_viol_inst, n_feas, n_infeas = evaluate_discrete(x_hat, batch, device)
 
         total_loss += loss.item()
         total_f_tilde += f_tilde
+        total_f_base += f_base
         total_max_viol += max_viol
         total_mean_viol += mean_viol
         total_feasibility += feas
@@ -506,7 +579,14 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         total_polarization += polar
         total_uncertainty += uncert
         total_xi_sum += xi_no_tau.sum().item()
+        total_xi_with_tau_sum += xi.sum().item()
+        total_xi_raw_sum += xi_raw.sum().item()
         total_num_graphs += batch.num_graphs
+
+        # Per-instance discrete
+        total_discrete_viol += avg_viol_inst * batch.num_graphs
+        total_feasible_inst += n_feas
+        total_infeasible_inst += n_infeas
 
         # Predicted 0/1 ratio
         x_rounded = torch.round(x_hat)
@@ -536,6 +616,17 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         'pred1_ratio': total_pred1_ratio / n_batches,
         'xi_mean_per_cons': total_xi_mean_per_cons / n_batches,
         'tau_mean': total_tau_mean / n_batches,
+        # Per-instance continuous metrics
+        'obj_margin_per_inst': total_f_tilde / total_num_graphs,
+        'obj_raw_per_inst': total_f_base / total_num_graphs,
+        'xi_margin_tau_per_inst': total_xi_with_tau_sum / total_num_graphs,
+        'xi_raw_per_inst': total_xi_raw_sum / total_num_graphs,
+        'xi_margin_per_inst': total_xi_sum / total_num_graphs,
+        # Per-instance discrete metrics
+        'disc_obj_per_inst': total_discrete_obj / total_num_graphs,
+        'disc_viol_per_inst': total_discrete_viol / total_num_graphs,
+        'n_feasible_inst': total_feasible_inst,
+        'n_infeasible_inst': total_infeasible_inst,
     }
     return metrics
 
@@ -562,6 +653,17 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed):
         f"rho={train_metrics['rho']:.4f}  "
         f"lambda={train_metrics['lambda_global']:.4f}  "
         f"K(gamma)={train_metrics['K_gamma']:.6f}",
+        # Train discrete per-instance
+        f"  [TDisc] AvgObj/inst={train_metrics['disc_obj_per_inst']:.4f}  "
+        f"AvgViol/inst={train_metrics['disc_viol_per_inst']:.6f}  "
+        f"FeasInst={train_metrics['n_feasible_inst']}  "
+        f"InfeasInst={train_metrics['n_infeasible_inst']}",
+        # Train continuous per-instance
+        f"  [TCont] ObjMargin/inst={train_metrics['obj_margin_per_inst']:.4f}  "
+        f"ObjRaw/inst={train_metrics['obj_raw_per_inst']:.4f}  "
+        f"Xi_m_t/inst={train_metrics['xi_margin_tau_per_inst']:.6f}  "
+        f"Xi_raw/inst={train_metrics['xi_raw_per_inst']:.6f}  "
+        f"Xi_m/inst={train_metrics['xi_margin_per_inst']:.6f}",
     ]
     if val_metrics:
         lines.append(
@@ -582,6 +684,21 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed):
             f"Objective={val_metrics['discrete_objective']:.4f}  "
             f"Polarization={val_metrics['polarization_rate']:.4f}  "
             f"Uncertainty={val_metrics['mean_uncertainty']:.4f}"
+        )
+        # Validation discrete per-instance
+        lines.append(
+            f"  [VDisc] AvgObj/inst={val_metrics['disc_obj_per_inst']:.4f}  "
+            f"AvgViol/inst={val_metrics['disc_viol_per_inst']:.6f}  "
+            f"FeasInst={val_metrics['n_feasible_inst']}  "
+            f"InfeasInst={val_metrics['n_infeasible_inst']}"
+        )
+        # Validation continuous per-instance
+        lines.append(
+            f"  [VCont] ObjMargin/inst={val_metrics['obj_margin_per_inst']:.4f}  "
+            f"ObjRaw/inst={val_metrics['obj_raw_per_inst']:.4f}  "
+            f"Xi_m_t/inst={val_metrics['xi_margin_tau_per_inst']:.6f}  "
+            f"Xi_raw/inst={val_metrics['xi_raw_per_inst']:.6f}  "
+            f"Xi_m/inst={val_metrics['xi_margin_per_inst']:.6f}"
         )
     return '\n'.join(lines)
 
@@ -617,6 +734,17 @@ def log_to_tensorboard(writer, train_metrics, val_metrics, epoch):
     writer.add_scalar('Violation/Xi_Mean_PerCons', train_metrics['xi_mean_per_cons'], epoch)
     writer.add_scalar('ALM/Tau_Mean', train_metrics['tau_mean'], epoch)
 
+    # Train per-instance metrics
+    writer.add_scalar('PerInst/Train_Obj_Margin', train_metrics['obj_margin_per_inst'], epoch)
+    writer.add_scalar('PerInst/Train_Obj_Raw', train_metrics['obj_raw_per_inst'], epoch)
+    writer.add_scalar('PerInst/Train_Xi_Margin_Tau', train_metrics['xi_margin_tau_per_inst'], epoch)
+    writer.add_scalar('PerInst/Train_Xi_Raw', train_metrics['xi_raw_per_inst'], epoch)
+    writer.add_scalar('PerInst/Train_Xi_Margin', train_metrics['xi_margin_per_inst'], epoch)
+    writer.add_scalar('PerInst/Train_Disc_Obj', train_metrics['disc_obj_per_inst'], epoch)
+    writer.add_scalar('PerInst/Train_Disc_Viol', train_metrics['disc_viol_per_inst'], epoch)
+    writer.add_scalar('PerInst/Train_Feasible', train_metrics['n_feasible_inst'], epoch)
+    writer.add_scalar('PerInst/Train_Infeasible', train_metrics['n_infeasible_inst'], epoch)
+
     if val_metrics:
         writer.add_scalar('Loss/Valid_Total', val_metrics['loss_total'], epoch)
         writer.add_scalar('Violation/Valid_Max', val_metrics['max_violation'], epoch)
@@ -635,6 +763,17 @@ def log_to_tensorboard(writer, train_metrics, val_metrics, epoch):
         writer.add_scalar('Prediction/Valid_Pred1_Ratio', val_metrics['pred1_ratio'], epoch)
         writer.add_scalar('Violation/Valid_Xi_Mean_PerCons', val_metrics['xi_mean_per_cons'], epoch)
         writer.add_scalar('ALM/Valid_Tau_Mean', val_metrics['tau_mean'], epoch)
+
+        # Validation per-instance metrics
+        writer.add_scalar('PerInst/Valid_Obj_Margin', val_metrics['obj_margin_per_inst'], epoch)
+        writer.add_scalar('PerInst/Valid_Obj_Raw', val_metrics['obj_raw_per_inst'], epoch)
+        writer.add_scalar('PerInst/Valid_Xi_Margin_Tau', val_metrics['xi_margin_tau_per_inst'], epoch)
+        writer.add_scalar('PerInst/Valid_Xi_Raw', val_metrics['xi_raw_per_inst'], epoch)
+        writer.add_scalar('PerInst/Valid_Xi_Margin', val_metrics['xi_margin_per_inst'], epoch)
+        writer.add_scalar('PerInst/Valid_Disc_Obj', val_metrics['disc_obj_per_inst'], epoch)
+        writer.add_scalar('PerInst/Valid_Disc_Viol', val_metrics['disc_viol_per_inst'], epoch)
+        writer.add_scalar('PerInst/Valid_Feasible', val_metrics['n_feasible_inst'], epoch)
+        writer.add_scalar('PerInst/Valid_Infeasible', val_metrics['n_infeasible_inst'], epoch)
 
 
 # ============================================================
@@ -669,6 +808,9 @@ def get_parser():
     parser.add_argument("--tau", type=float, default=0.9,
                         help="Reference point x_0 for per-constraint tolerance "
                              "tau_j(gamma) = K(gamma)*sqrt(u(x_0))*sum|A_ji| (default: %(default)s)")
+    parser.add_argument("--tau_min", type=float, default=0.99,
+                        help="Minimum value for tau_j(gamma); values below this are clamped "
+                             "(default: %(default)s). Set to 0 to disable.")
     parser.add_argument("--gamma_init", type=float, default=1.0,
                         help="Initial state sharpness (default: %(default)s)")
     parser.add_argument("--gamma_max", type=float, default=50.0,
@@ -731,8 +873,11 @@ def get_parser():
 
     # ALM freezing: freeze lambda (and optionally gamma/rho) when xi_sum < threshold2
     parser.add_argument("--es_xi_threshold2", type=float, default=None,
-                        help="When valid xi_sum/sample < this, freeze lambda. "
+                        help="When xi_sum/sample < this, freeze lambda. "
                              "None = disabled (default: %(default)s)")
+    parser.add_argument("--threshold2_on", choices=['train', 'valid'], default='valid',
+                        help="Whether es_xi_threshold2 acts on train or valid metrics "
+                             "(default: %(default)s)")
     parser.add_argument("--freeze_gamma_on_feasible", action='store_true', default=False,
                         help="Also freeze gamma when xi_sum < es_xi_threshold2")
     parser.add_argument("--freeze_rho_on_feasible", action='store_true', default=False,
@@ -754,9 +899,10 @@ def main():
     batch_size = args.batch_size or TASK_BATCH_SIZE.get(problem_type, 4)
 
     save_name = (
-        f'ALM_tau{args.tau}_gamma{args.gamma_init}_rho{args.rho_init}'
+        f'ALM_tau{args.tau}_taumin{args.tau_min}_gamma{args.gamma_init}_rho{args.rho_init}'
         f'_inner{args.inner_steps}_ent{args.entropy_weight}'
         f'_ICC{args.Intra_Constraint_Competitive}'
+        f'_esxi{args.es_xi_threshold}_esxi2{args.es_xi_threshold2}_t2on{args.threshold2_on}'
     )
 
     # Create directories
@@ -887,10 +1033,14 @@ def main():
     best_feasible = False  # whether best model satisfies xi threshold
     patience_counter = 0
     alm_frozen = False  # whether ALM params are frozen due to es_xi_threshold2
+    best_allfeas_obj = float('inf')  # best discrete obj when ALL val instances are feasible
+
+    # Resolve tau_min: 0 means disabled
+    tau_min = args.tau_min if args.tau_min > 0 else None
 
     print(f"\n{'='*70}")
     print(f"Starting Unsupervised ALM Training for {problem_type}")
-    print(f"  tau={args.tau}, gamma_init={args.gamma_init}, rho_init={args.rho_init}")
+    print(f"  tau={args.tau}, tau_min={tau_min}, gamma_init={args.gamma_init}, rho_init={args.rho_init}")
     print(f"  inner_steps={args.inner_steps}, beta={args.beta}")
     print(f"  entropy_weight={args.entropy_weight}, grad_clip={args.grad_clip_norm}")
     print(f"  LR={args.lr}, schedule={args.lr_schedule}, warmup={args.warmup_epochs}")
@@ -910,6 +1060,7 @@ def main():
             args.entropy_weight, args.cons_normalize, args.grad_clip_norm,
             device, step_counter,
             freeze_lambda=freeze_lambda, freeze_gamma=freeze_gamma, freeze_rho=freeze_rho,
+            tau_min=tau_min,
         )
 
         # Validate periodically
@@ -923,15 +1074,16 @@ def main():
                 model, valid_loader,
                 gamma, args.tau, lambda_global, rho,
                 args.entropy_weight, args.cons_normalize, device,
+                tau_min=tau_min,
             )
 
             if ema is not None:
                 ema.restore(model, backup)
 
             # Save best model
-            # Primary: xi_sum below threshold → feasible; secondary: lowest objective
+            # Primary: xi_sum below threshold → feasible; secondary: lowest discrete objective per instance
             curr_xi = val_metrics['xi_sum_per_sample']
-            curr_obj = val_metrics['objective_per_sample']
+            curr_obj = val_metrics['disc_obj_per_inst']
             curr_feasible = curr_xi < args.es_xi_threshold
 
             is_best = False
@@ -961,19 +1113,53 @@ def main():
             else:
                 patience_counter += 1
 
-            # Check ALM freeze condition
-            if (not alm_frozen
-                    and args.es_xi_threshold2 is not None
-                    and curr_xi < args.es_xi_threshold2):
-                alm_frozen = True
-                frozen_parts = ["lambda"]
-                if args.freeze_gamma_on_feasible:
-                    frozen_parts.append("gamma")
-                if args.freeze_rho_on_feasible:
-                    frozen_parts.append("rho")
-                print(f"  [Freeze] xi_sum/sample={curr_xi:.6f} < threshold2={args.es_xi_threshold2} "
-                      f"=> freezing {', '.join(frozen_parts)} "
-                      f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
+            # Save best all-feasible model:
+            # ALL validation instances feasible after discretization + best discrete objective
+            n_infeas = val_metrics['n_infeasible_inst']
+            if n_infeas == 0:
+                if curr_obj < best_allfeas_obj - 1e-6:
+                    best_allfeas_obj = curr_obj
+                    save_state = ema.shadow if ema is not None else model.state_dict()
+                    af_path = os.path.join(model_save_path, f'{save_name}_model_best_allfeas.pth')
+                    if isinstance(save_state, dict) and all(isinstance(v, torch.Tensor) for v in save_state.values()):
+                        torch.save(save_state, af_path)
+                    else:
+                        torch.save(model.state_dict(), af_path)
+                    print(f"  [AllFeas] Saved best all-feasible model: "
+                          f"disc_obj/inst={curr_obj:.4f}, n_infeasible=0")
+
+        # Check ALM freeze/unfreeze condition (can act on train or valid metrics)
+        if args.es_xi_threshold2 is not None:
+            if args.threshold2_on == 'train':
+                freeze_xi = train_metrics['xi_sum_per_sample']
+                freeze_src = 'train'
+            else:
+                # Only check when validation was performed this epoch
+                if val_metrics is not None:
+                    freeze_xi = val_metrics['xi_sum_per_sample']
+                    freeze_src = 'valid'
+                else:
+                    freeze_xi = None
+                    freeze_src = None
+
+            if freeze_xi is not None:
+                if freeze_xi < args.es_xi_threshold2:
+                    if not alm_frozen:
+                        alm_frozen = True
+                        frozen_parts = ["lambda"]
+                        if args.freeze_gamma_on_feasible:
+                            frozen_parts.append("gamma")
+                        if args.freeze_rho_on_feasible:
+                            frozen_parts.append("rho")
+                        print(f"  [Freeze] {freeze_src} xi_sum/sample={freeze_xi:.6f} < threshold2={args.es_xi_threshold2} "
+                              f"=> freezing {', '.join(frozen_parts)} "
+                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
+                else:
+                    if alm_frozen:
+                        alm_frozen = False
+                        print(f"  [Unfreeze] {freeze_src} xi_sum/sample={freeze_xi:.6f} >= threshold2={args.es_xi_threshold2} "
+                              f"=> resuming all ALM updates "
+                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
 
         # Save latest (full checkpoint for resumable training)
         full_ckpt = {
