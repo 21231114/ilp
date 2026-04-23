@@ -325,6 +325,13 @@ class EMAModel:
             if name in backup:
                 param.data.copy_(backup[name])
 
+    def state_dict(self, model):
+        """Merge EMA trainable params with model buffers (e.g. BatchNorm running stats)."""
+        state = model.state_dict()
+        for name in self.shadow:
+            state[name] = self.shadow[name]
+        return state
+
 
 # ============================================================
 #  Training Loop
@@ -1105,11 +1112,8 @@ def main():
                 best_val_xi_sum = curr_xi
                 best_val_obj = curr_obj
                 patience_counter = 0
-                save_state = ema.shadow if ema is not None else model.state_dict()
-                if isinstance(save_state, dict) and all(isinstance(v, torch.Tensor) for v in save_state.values()):
-                    torch.save(save_state, os.path.join(model_save_path, f'{save_name}_model_best.pth'))
-                else:
-                    torch.save(model.state_dict(), os.path.join(model_save_path, f'{save_name}_model_best.pth'))
+                save_state = ema.state_dict(model) if ema is not None else model.state_dict()
+                torch.save(save_state, os.path.join(model_save_path, f'{save_name}_model_best.pth'))
             else:
                 patience_counter += 1
 
@@ -1119,12 +1123,9 @@ def main():
             if n_infeas == 0:
                 if curr_obj < best_allfeas_obj - 1e-6:
                     best_allfeas_obj = curr_obj
-                    save_state = ema.shadow if ema is not None else model.state_dict()
+                    save_state = ema.state_dict(model) if ema is not None else model.state_dict()
                     af_path = os.path.join(model_save_path, f'{save_name}_model_best_allfeas.pth')
-                    if isinstance(save_state, dict) and all(isinstance(v, torch.Tensor) for v in save_state.values()):
-                        torch.save(save_state, af_path)
-                    else:
-                        torch.save(model.state_dict(), af_path)
+                    torch.save(save_state, af_path)
                     print(f"  [AllFeas] Saved best all-feasible model: "
                           f"disc_obj/inst={curr_obj:.4f}, n_infeasible=0")
 

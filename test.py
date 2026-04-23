@@ -55,7 +55,12 @@ def load_pretrained_model(args: argparse.Namespace, model_path: str, device: tor
     ).to(device)
     
     state = torch.load(model_path, map_location=device, weights_only=True)
-    model.load_state_dict(state, strict=False)
+    incompatible = model.load_state_dict(state, strict=False)
+    if incompatible.missing_keys:
+        print(f"[WARNING] Missing keys when loading model (likely EMA-only save without BatchNorm buffers):")
+        for k in incompatible.missing_keys:
+            print(f"  {k}")
+        print("  Inference results may be incorrect. Re-train or re-save the model with the fixed train.py.")
     model.eval()
     
     return model
