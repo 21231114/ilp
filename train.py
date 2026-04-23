@@ -890,6 +890,9 @@ def get_parser():
     parser.add_argument("--freeze_rho_on_feasible", action='store_true', default=False,
                         help="Also freeze rho when xi_sum < es_xi_threshold2")
 
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Random seed for reproducibility (default: %(default)s)")
+
     return parser
 
 
@@ -904,6 +907,11 @@ def main():
     device = args.device
     problem_type = args.problem_type
     batch_size = args.batch_size or TASK_BATCH_SIZE.get(problem_type, 4)
+
+    # Fix random seed for reproducibility
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
 
     save_name = (
         f'ALM_tau{args.tau}_taumin{args.tau_min}_gamma{args.gamma_init}_rho{args.rho_init}'
