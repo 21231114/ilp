@@ -233,8 +233,9 @@ def compute_rounded_violations(instance_path, var_names, rounded_values):
 
     max_v  = float(viol.max())
     mean_v = float(viol.mean())
+    total_v = float(viol.sum())
     n_viol = int((viol > 1e-6).sum())
-    return obj_val, max_v, mean_v, n_viol, len(viol_list)
+    return obj_val, max_v, mean_v, total_v, n_viol, len(viol_list)
 
 
 def load_solution(sol_path):
@@ -342,6 +343,12 @@ def run_inference_only(args, policy):
     all_topk_acc = []
     all_mse = []
 
+    all_feas = []
+    all_obj_round = []
+    all_max_viol = []
+    all_total_viol = []
+    all_n_violated = []
+
     for idx, ins_name in enumerate(test_instances):
         ins_path = os.path.join(args.instance_dir, args.test_problem_type, ins_name)
         if not os.path.exists(ins_path):
@@ -406,6 +413,18 @@ def run_inference_only(args, policy):
         else:
             print(f"  [WARN] Solution file not found: {sol_path}")
 
+        # ---- 3c. 四舍五入后评估可行性和约束违反量 ----
+        BD_rounded = torch.round(BD).detach().numpy()
+        obj_val_r, max_v, mean_v, total_v, n_viol, n_total = compute_rounded_violations(
+            ins_path, all_varname, BD_rounded
+        )
+        feas = 1.0 if n_viol == 0 else 0.0
+        all_feas.append(feas)
+        all_obj_round.append(obj_val_r)
+        all_max_viol.append(max_v)
+        all_total_viol.append(total_v)
+        all_n_violated.append(n_viol)
+
         # ---- 4. 启发式固定 + 加信赖域约束 + 导出新实例 ----
         #        用 pyscipopt 做模型 I/O（开源，无 license 限制）
         scores, delta = fix_pas(scores, args.test_problem_type, args)
@@ -456,6 +475,8 @@ def run_inference_only(args, policy):
         print(f"[{idx+1}/{len(test_instances)}] {ins_name}  "
               f"binary={len(scores)}  fixed={n_fixed}  conf={n_conf}  delta={delta}  "
               f"CE={ce_str}  MSE={mse_str}  Acc={acc_str}  Top{args.topk}-Acc={topk_acc_str}  "
+              f"Obj={obj_val_r:.4f}  MaxViol={max_v:.6f}  "
+              f"Violated={n_viol}/{n_total}  Feasible={'YES' if feas else 'NO'}  "
               f"feat={feature_time:.4f}s  infer={infer_time:.4f}s  "
               f"total={total_time:.4f}s  -> {os.path.basename(out_path)}")
 
@@ -493,6 +514,36 @@ def run_inference_only(args, policy):
                   f"median={np.median(topk_acc_arr):.4f}")
         else:
             print("\n  No solution files found; CE/Acc statistics not available.")
+
+        if all_feas:
+            feas_arr = np.array(all_feas)
+            obj_arr = np.array(all_obj_round)
+            viol_arr = np.array(all_max_viol)
+            total_viol_arr = np.array(all_total_viol)
+
+            feasible_mask = feas_arr > 0.5
+            infeasible_mask = ~feasible_mask
+            n_feas = int(feasible_mask.sum())
+            n_infeas = int(infeasible_mask.sum())
+
+            print(f"\n  Rounded Feasibility ({len(all_feas)} instances):")
+            print(f"    Feasible instances:   {n_feas}")
+            print(f"    Infeasible instances: {n_infeas}")
+
+            if n_feas > 0:
+                print(f"    Feasible   — Avg Objective: {obj_arr[feasible_mask].mean():.4f}")
+            else:
+                print(f"    Feasible   — (none)")
+
+            if n_infeas > 0:
+                print(f"    Infeasible — Avg Total Violation: {total_viol_arr[infeasible_mask].mean():.4f}")
+                print(f"    Infeasible — Avg Objective:       {obj_arr[infeasible_mask].mean():.4f}")
+            else:
+                print(f"    Infeasible — (none)")
+
+            print(f"    Max Violation:     mean={viol_arr.mean():.6f}  max={viol_arr.max():.6f}")
+            print(f"    Total time: {sum_total:.2f}s  Avg: {sum_total/count:.3f}s")
+
         print(f"{'='*60}")
 
 
@@ -518,6 +569,7 @@ def run_unsupervised_eval(args, policy):
     all_feas = []
     all_obj = []
     all_max_viol = []
+    all_total_viol = []
     all_n_violated = []
     sum_time = 0.0
 
@@ -555,10 +607,10 @@ def run_unsupervised_eval(args, policy):
         all_varname = list(v_map)
 
         # Round
-        BD_rounded = torch.round(BD).numpy()
+        BD_rounded = torch.round(BD).detach().numpy()
 
         # Evaluate constraint violations (pyscipopt)
-        obj_val, max_v, mean_v, n_viol, n_total = compute_rounded_violations(
+        obj_val, max_v, mean_v, total_v, n_viol, n_total = compute_rounded_violations(
             ins_path, all_varname, BD_rounded
         )
 
@@ -569,6 +621,7 @@ def run_unsupervised_eval(args, policy):
         all_feas.append(feas)
         all_obj.append(obj_val)
         all_max_viol.append(max_v)
+        all_total_viol.append(total_v)
         all_n_violated.append(n_viol)
 
         # Polarization
@@ -583,16 +636,29 @@ def run_unsupervised_eval(args, policy):
         feas_arr = np.array(all_feas)
         obj_arr = np.array(all_obj)
         viol_arr = np.array(all_max_viol)
+        total_viol_arr = np.array(all_total_viol)
+
+        feasible_mask = feas_arr > 0.5
+        infeasible_mask = ~feasible_mask
+        n_feas = int(feasible_mask.sum())
+        n_infeas = int(infeasible_mask.sum())
 
         print(f"\n{'='*60}")
         print(f"Summary ({len(all_feas)} instances):")
-        print(f"  Feasibility Rate: {feas_arr.mean():.4f} ({feas_arr.sum():.0f}/{len(feas_arr)})")
-        print(f"  Objective (all):   mean={obj_arr.mean():.4f}  std={obj_arr.std():.4f}")
-        # Objective for feasible solutions only
-        feasible_mask = feas_arr > 0.5
-        if feasible_mask.sum() > 0:
-            print(f"  Objective (feas):  mean={obj_arr[feasible_mask].mean():.4f}  "
-                  f"std={obj_arr[feasible_mask].std():.4f}")
+        print(f"  Feasible instances:   {n_feas}")
+        print(f"  Infeasible instances: {n_infeas}")
+
+        if n_feas > 0:
+            print(f"  Feasible   — Avg Objective: {obj_arr[feasible_mask].mean():.4f}")
+        else:
+            print(f"  Feasible   — (none)")
+
+        if n_infeas > 0:
+            print(f"  Infeasible — Avg Total Violation: {total_viol_arr[infeasible_mask].mean():.4f}")
+            print(f"  Infeasible — Avg Objective:       {obj_arr[infeasible_mask].mean():.4f}")
+        else:
+            print(f"  Infeasible — (none)")
+
         print(f"  Max Violation:     mean={viol_arr.mean():.6f}  max={viol_arr.max():.6f}")
         print(f"  Total time: {sum_time:.2f}s  Avg: {sum_time/len(all_feas):.3f}s")
         print(f"{'='*60}")
@@ -604,7 +670,7 @@ def parse_arguments() -> argparse.Namespace:
     exp_group = parser.add_argument_group("Experiment Settings")
     exp_group.add_argument("--test_problem_type", type=str, choices=TASKS, default='SC',help="Problem type to train on (e.g., CA, WA, IP)")
     
-    exp_group.add_argument("--test_num", type=int, default=300,
+    exp_group.add_argument("--test_num", type=int, default=100,
                          help="Number of test instances to process")
     
     model_group = parser.add_argument_group("Model Settings")
@@ -633,7 +699,7 @@ def parse_arguments() -> argparse.Namespace:
  
     sys_group = parser.add_argument_group("System Settings")
     sys_group.add_argument("--instance_dir",
-                         default="/home/lmh/autodl-tmp/data/l2o_milp",
+                         default="/home/lmh/autodl-tmp/data/l2o_milp_test",
                          help="Path to test instances directory")
     sys_group.add_argument("--scores_dir", default="./scores",
                          help="Path to store scores directory")
@@ -699,11 +765,7 @@ def main():
         f'_k0_{args.k0}_k1_{args.k1}_delta_{args.delta}'
     )
 
-    model_path = os.path.join(
-        args.model_dir, args.test_problem_type,
-        f"Intra_Constraint_Competitive_{args.Intra_Constraint_Competitive}"
-        f"_margin_{args.margin}_alpha_{args.alpha}_tao_{args.tao}_model_best.pth"
-    )
+    model_path = args.model_dir
     policy = load_pretrained_model(args, model_path, args.device)
 
     log_dir = os.path.join(args.log_dir, args.test_problem_type, save_name)
