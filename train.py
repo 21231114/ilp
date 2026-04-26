@@ -16,8 +16,9 @@ import copy
 import torch
 import torch.nn as nn
 import torch_geometric
+from torch_geometric.utils import unbatch
 
-from utils import TASKS
+from utils import TASKS, extract_raw_ilp
 from gnn import GNNPolicy
 from dataset.unsupervised_dataset import UnsupervisedGraphDataset
 
@@ -31,6 +32,96 @@ torch.sparse.check_sparse_tensor_invariants.disable()
 #  Task-specific defaults
 # ============================================================
 TASK_BATCH_SIZE = {'CA': 4, 'WA': 4, 'IP': 4, 'SC': 1, 'IS': 4}
+
+
+# ============================================================
+#  Gumbel-Softmax Sampling Utilities
+# ============================================================
+
+def gumbel_sample(logits, N, tau=1.0):
+    """
+    Gumbel-Softmax sampling for differentiable binary decisions.
+
+    Args:
+        logits: [n_vars] or [n_vars, 1] raw logits from the GNN.
+        N: number of solutions to sample.
+        tau: Gumbel-Softmax temperature.
+
+    Returns:
+        [N, n_vars] binary samples (hard via straight-through estimator).
+    """
+    logits = logits.reshape(-1, 1)
+    logits = logits.repeat(N, 1, 1)                                  # [N, n_vars, 1]
+    logits = torch.cat([torch.zeros_like(logits), logits], dim=-1)    # [N, n_vars, 2]
+    return torch.nn.functional.gumbel_softmax(logits, tau=tau, hard=True)[:, :, 1]
+
+
+def build_dense_A(raw_cons_indices, raw_cons_values, n_cons, n_vars, device):
+    """Build dense constraint matrix A from sparse representation."""
+    A = torch.zeros(n_cons, n_vars, device=device)
+    row = raw_cons_indices[0].to(device)
+    col = raw_cons_indices[1].to(device)
+    val = raw_cons_values.to(device)
+    A[row, col] = val
+    return A
+
+
+def map_logits_to_raw(logits_gnn, gnn_to_raw_map, n_raw_vars, device):
+    """
+    Map GNN-ordered logits to raw ILP variable order via scatter-average.
+    """
+    logits_raw = torch.zeros(n_raw_vars, device=device)
+    count = torch.zeros(n_raw_vars, device=device)
+    gnn_to_raw = gnn_to_raw_map.to(device)
+    logits_raw.scatter_add_(0, gnn_to_raw, logits_gnn)
+    count.scatter_add_(0, gnn_to_raw, torch.ones_like(logits_gnn))
+    count = count.clamp(min=1)
+    return logits_raw / count
+
+
+@torch.no_grad()
+def evaluate_by_sampling(logits_gnn, graph, n_eval_samples, device):
+    """
+    Evaluate a graph by sampling many solutions and finding the best feasible one.
+
+    Returns:
+        best_feasible_obj: best objective among feasible solutions (inf if none).
+        best_obj: best objective among all solutions.
+        mean_obj: mean objective over all solutions.
+        mean_feasible_obj: mean objective among feasible solutions (inf if none).
+        n_feasible: number of feasible solutions found.
+    """
+    n_raw_vars = graph.obj_coeffs.shape[0]
+    n_cons = graph.raw_n_cons if isinstance(graph.raw_n_cons, int) else graph.raw_n_cons.item()
+
+    logits_raw = map_logits_to_raw(logits_gnn, graph.gnn_to_raw_map, n_raw_vars, device)
+
+    A = build_dense_A(graph.raw_cons_indices, graph.raw_cons_values, n_cons, n_raw_vars, device)
+    b = graph.raw_rhs.to(device).reshape(-1, 1)
+    c = graph.obj_coeffs.to(device).reshape(-1, 1)
+
+    # Sample solutions
+    xx = gumbel_sample(logits_raw, n_eval_samples, tau=1.0).float().reshape(n_eval_samples, -1)
+
+    # Objectives for all samples
+    objs = (xx @ c).squeeze(-1)  # [n_eval_samples]
+
+    # Find feasible solutions: all constraints satisfied
+    violations = torch.relu(A @ xx.T - b).sum(dim=0)  # [n_eval_samples]
+    feasible_mask = (violations == 0)
+    n_feasible = feasible_mask.sum().item()
+
+    if n_feasible > 0:
+        best_feasible_obj = objs[feasible_mask].min().item()
+        mean_feasible_obj = objs[feasible_mask].mean().item()
+    else:
+        best_feasible_obj = float('inf')
+        mean_feasible_obj = float('inf')
+
+    best_obj = objs.min().item()
+    mean_obj = objs.mean().item()
+
+    return best_feasible_obj, best_obj, mean_obj, mean_feasible_obj, n_feasible
 
 
 # ============================================================
@@ -290,6 +381,14 @@ def evaluate_discrete(x_hat, batch, device):
             avg_violation_per_instance, n_feasible_instances, n_infeasible_instances)
 
 
+def obj_is_better(curr, best, is_minimize, tol=1e-6):
+    """Check if curr objective is better than best, respecting optimization direction."""
+    if is_minimize:
+        return curr < best - tol
+    else:
+        return curr > best + tol
+
+
 # ============================================================
 #  EMA Model
 # ============================================================
@@ -509,9 +608,10 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
 
 @torch.no_grad()
 def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
-                   entropy_weight, cons_normalize, device, tau_min=None):
+                   entropy_weight, cons_normalize, device, tau_min=None,
+                   n_eval_samples=0):
     """
-    Validate: compute ALM loss + discrete rounding metrics.
+    Validate: compute ALM loss + discrete rounding metrics + sampling metrics.
     """
     model.eval()
 
@@ -536,6 +636,14 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
     total_discrete_viol = 0.0
     total_feasible_inst = 0
     total_infeasible_inst = 0
+    # Sampling metrics accumulators
+    sample_best_feasible_sum = 0.0          # sum of best feasible obj over feasible instances
+    sample_mean_feasible_obj_sum = 0.0      # sum of mean feasible obj over feasible instances
+    sample_best_obj_sum = 0.0               # sum of best obj (all samples) over all instances
+    sample_mean_obj_sum = 0.0               # sum of mean obj (all samples) over all instances
+    sample_total_feasible = 0               # total number of feasible samples
+    sample_n_feasible_instances = 0         # instances with at least one feasible sample
+    sample_total_samples = 0               # total number of samples across all instances
     n_batches = 0
 
     for batch in data_loader:
@@ -604,6 +712,23 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         # Mean tau_j
         total_tau_mean += tau_vec.mean().item()
 
+        # Sampling evaluation (per-graph)
+        if n_eval_samples > 0:
+            logits_per_graph = unbatch(logits, variable_features_batch)
+            graphs = batch.to_data_list()
+            for i, g in enumerate(graphs):
+                best_feas, best_obj, mean_obj, mean_feas_obj, n_feas_s = evaluate_by_sampling(
+                    logits_per_graph[i], g, n_eval_samples, device
+                )
+                sample_best_obj_sum += best_obj
+                sample_mean_obj_sum += mean_obj
+                sample_total_feasible += n_feas_s
+                sample_total_samples += n_eval_samples
+                if n_feas_s > 0:
+                    sample_best_feasible_sum += best_feas
+                    sample_mean_feasible_obj_sum += mean_feas_obj
+                    sample_n_feasible_instances += 1
+
         n_batches += 1
 
     n_batches = max(n_batches, 1)
@@ -634,6 +759,16 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         'disc_viol_per_inst': total_discrete_viol / total_num_graphs,
         'n_feasible_inst': total_feasible_inst,
         'n_infeasible_inst': total_infeasible_inst,
+        # Sampling metrics
+        'sample_best_feasible_obj': sample_best_feasible_sum / max(sample_n_feasible_instances, 1),
+        'sample_mean_feasible_obj': sample_mean_feasible_obj_sum / max(sample_n_feasible_instances, 1),
+        'sample_best_obj': sample_best_obj_sum / total_num_graphs,
+        'sample_mean_obj': sample_mean_obj_sum / total_num_graphs,
+        'sample_feasible_rate': sample_total_feasible / max(sample_total_samples, 1),
+        'sample_n_feasible_instances': sample_n_feasible_instances,
+        'sample_total_feasible': sample_total_feasible,
+        'sample_total_samples': sample_total_samples,
+        'n_valid_instances': total_num_graphs,
     }
     return metrics
 
@@ -642,8 +777,10 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
 #  Logging Utilities
 # ============================================================
 
-def format_metrics(train_metrics, val_metrics, epoch, elapsed):
+def format_metrics(train_metrics, val_metrics, epoch, elapsed, is_minimize=True):
     """Format metrics for console and file logging."""
+    obj_sign = 1.0 if is_minimize else -1.0
+    opt_label = "↓" if is_minimize else "↑"
     lines = [
         f"@epoch{epoch}  TIME:{elapsed:.1f}s",
         f"  [Train] Loss={train_metrics['loss_total']:.6f}  "
@@ -661,13 +798,13 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed):
         f"lambda={train_metrics['lambda_global']:.4f}  "
         f"K(gamma)={train_metrics['K_gamma']:.6f}",
         # Train discrete per-instance
-        f"  [TDisc] AvgObj/inst={train_metrics['disc_obj_per_inst']:.4f}  "
+        f"  [TDisc] AvgObj/inst={train_metrics['disc_obj_per_inst'] * obj_sign:.4f}{opt_label}  "
         f"AvgViol/inst={train_metrics['disc_viol_per_inst']:.6f}  "
         f"FeasInst={train_metrics['n_feasible_inst']}  "
         f"InfeasInst={train_metrics['n_infeasible_inst']}",
         # Train continuous per-instance
-        f"  [TCont] ObjMargin/inst={train_metrics['obj_margin_per_inst']:.4f}  "
-        f"ObjRaw/inst={train_metrics['obj_raw_per_inst']:.4f}  "
+        f"  [TCont] ObjMargin/inst={train_metrics['obj_margin_per_inst'] * obj_sign:.4f}  "
+        f"ObjRaw/inst={train_metrics['obj_raw_per_inst'] * obj_sign:.4f}  "
         f"Xi_m_t/inst={train_metrics['xi_margin_tau_per_inst']:.6f}  "
         f"Xi_raw/inst={train_metrics['xi_raw_per_inst']:.6f}  "
         f"Xi_m/inst={train_metrics['xi_margin_per_inst']:.6f}",
@@ -678,7 +815,7 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed):
             f"MaxViol={val_metrics['max_violation']:.6f}  "
             f"MeanViol={val_metrics['mean_violation']:.6f}  "
             f"XiSum/s={val_metrics['xi_sum_per_sample']:.6f}  "
-            f"AvgObj/s={val_metrics['objective_per_sample']:.4f}"
+            f"AvgObj/s={val_metrics['objective_per_sample'] * obj_sign:.4f}{opt_label}"
         )
         lines.append(
             f"  [VPred] Pred0={val_metrics['pred0_ratio']:.4f}  "
@@ -688,25 +825,34 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed):
         )
         lines.append(
             f"  [Disc]  Feasibility={val_metrics['feasibility_rate']:.4f}  "
-            f"Objective={val_metrics['discrete_objective']:.4f}  "
+            f"Objective={val_metrics['discrete_objective'] * obj_sign:.4f}{opt_label}  "
             f"Polarization={val_metrics['polarization_rate']:.4f}  "
             f"Uncertainty={val_metrics['mean_uncertainty']:.4f}"
         )
         # Validation discrete per-instance
         lines.append(
-            f"  [VDisc] AvgObj/inst={val_metrics['disc_obj_per_inst']:.4f}  "
+            f"  [VDisc] AvgObj/inst={val_metrics['disc_obj_per_inst'] * obj_sign:.4f}{opt_label}  "
             f"AvgViol/inst={val_metrics['disc_viol_per_inst']:.6f}  "
             f"FeasInst={val_metrics['n_feasible_inst']}  "
             f"InfeasInst={val_metrics['n_infeasible_inst']}"
         )
         # Validation continuous per-instance
         lines.append(
-            f"  [VCont] ObjMargin/inst={val_metrics['obj_margin_per_inst']:.4f}  "
-            f"ObjRaw/inst={val_metrics['obj_raw_per_inst']:.4f}  "
+            f"  [VCont] ObjMargin/inst={val_metrics['obj_margin_per_inst'] * obj_sign:.4f}  "
+            f"ObjRaw/inst={val_metrics['obj_raw_per_inst'] * obj_sign:.4f}  "
             f"Xi_m_t/inst={val_metrics['xi_margin_tau_per_inst']:.6f}  "
             f"Xi_raw/inst={val_metrics['xi_raw_per_inst']:.6f}  "
             f"Xi_m/inst={val_metrics['xi_margin_per_inst']:.6f}"
         )
+        # Sampling metrics
+        if val_metrics.get('sample_total_samples', 0) > 0:
+            lines.append(
+                f"  [Sample] BestFeasObj={val_metrics['sample_best_feasible_obj'] * obj_sign:.4f}{opt_label}  "
+                f"MeanFeasObj={val_metrics['sample_mean_feasible_obj'] * obj_sign:.4f}{opt_label}  "
+                f"FeasRate={val_metrics['sample_feasible_rate']:.4f}  "
+                f"FeasInst={val_metrics['sample_n_feasible_instances']}/{val_metrics['n_valid_instances']}  "
+                f"FeasSamples={val_metrics['sample_total_feasible']}/{val_metrics['sample_total_samples']}"
+            )
     return '\n'.join(lines)
 
 
@@ -717,10 +863,12 @@ except ImportError:
     HAS_TENSORBOARD = False
 
 
-def log_to_tensorboard(writer, train_metrics, val_metrics, epoch):
+def log_to_tensorboard(writer, train_metrics, val_metrics, epoch, is_minimize=True):
     """Log all metrics to TensorBoard."""
     if writer is None:
         return
+
+    obj_sign = 1.0 if is_minimize else -1.0
 
     # Loss & game dynamics
     writer.add_scalar('Loss/Total', train_metrics['loss_total'], epoch)
@@ -748,6 +896,7 @@ def log_to_tensorboard(writer, train_metrics, val_metrics, epoch):
     writer.add_scalar('PerInst/Train_Xi_Raw', train_metrics['xi_raw_per_inst'], epoch)
     writer.add_scalar('PerInst/Train_Xi_Margin', train_metrics['xi_margin_per_inst'], epoch)
     writer.add_scalar('PerInst/Train_Disc_Obj', train_metrics['disc_obj_per_inst'], epoch)
+    writer.add_scalar('PerInst/Train_Disc_Obj_Orig', train_metrics['disc_obj_per_inst'] * obj_sign, epoch)
     writer.add_scalar('PerInst/Train_Disc_Viol', train_metrics['disc_viol_per_inst'], epoch)
     writer.add_scalar('PerInst/Train_Feasible', train_metrics['n_feasible_inst'], epoch)
     writer.add_scalar('PerInst/Train_Infeasible', train_metrics['n_infeasible_inst'], epoch)
@@ -778,9 +927,20 @@ def log_to_tensorboard(writer, train_metrics, val_metrics, epoch):
         writer.add_scalar('PerInst/Valid_Xi_Raw', val_metrics['xi_raw_per_inst'], epoch)
         writer.add_scalar('PerInst/Valid_Xi_Margin', val_metrics['xi_margin_per_inst'], epoch)
         writer.add_scalar('PerInst/Valid_Disc_Obj', val_metrics['disc_obj_per_inst'], epoch)
+        writer.add_scalar('PerInst/Valid_Disc_Obj_Orig', val_metrics['disc_obj_per_inst'] * obj_sign, epoch)
         writer.add_scalar('PerInst/Valid_Disc_Viol', val_metrics['disc_viol_per_inst'], epoch)
         writer.add_scalar('PerInst/Valid_Feasible', val_metrics['n_feasible_inst'], epoch)
         writer.add_scalar('PerInst/Valid_Infeasible', val_metrics['n_infeasible_inst'], epoch)
+
+        # Sampling metrics
+        if val_metrics.get('sample_total_samples', 0) > 0:
+            writer.add_scalar('Sample/Best_Feasible_Obj', val_metrics['sample_best_feasible_obj'], epoch)
+            writer.add_scalar('Sample/Mean_Feasible_Obj', val_metrics['sample_mean_feasible_obj'], epoch)
+            writer.add_scalar('Sample/Best_Obj', val_metrics['sample_best_obj'], epoch)
+            writer.add_scalar('Sample/Mean_Obj', val_metrics['sample_mean_obj'], epoch)
+            writer.add_scalar('Sample/Feasible_Rate', val_metrics['sample_feasible_rate'], epoch)
+            writer.add_scalar('Sample/Feasible_Instances', val_metrics['sample_n_feasible_instances'], epoch)
+            writer.add_scalar('Sample/Total_Feasible', val_metrics['sample_total_feasible'], epoch)
 
 
 # ============================================================
@@ -838,6 +998,9 @@ def get_parser():
                         help="Max gradient norm for clipping (0 = no clipping)")
     parser.add_argument("--entropy_weight", type=float, default=0.01,
                         help="Binary entropy regularization weight (default: %(default)s)")
+    parser.add_argument("--n_eval_samples", type=int, default=500,
+                        help="Number of Gumbel-Softmax samples for validation sampling evaluation "
+                             "(0 = disabled) (default: %(default)s)")
     parser.add_argument("--cons_normalize", action='store_true', default=True,
                         help="Normalize constraint violations by row norm")
     parser.add_argument("--no_cons_normalize", action='store_false', dest='cons_normalize')
@@ -889,6 +1052,14 @@ def get_parser():
                         help="Also freeze gamma when xi_sum < es_xi_threshold2")
     parser.add_argument("--freeze_rho_on_feasible", action='store_true', default=False,
                         help="Also freeze rho when xi_sum < es_xi_threshold2")
+
+    # Adaptive ALM freezing based on sampling feasibility
+    parser.add_argument("--freeze_on_all_sample_feasible", action='store_true', default=False,
+                        help="Freeze lambda when ALL validation instances have at least one "
+                             "feasible sampled solution; resume normal updates when any instance "
+                             "has no feasible samples. Requires --n_eval_samples > 0. "
+                             "Use --freeze_gamma_on_feasible and --freeze_rho_on_feasible "
+                             "to also freeze gamma and rho.")
 
     parser.add_argument("--seed", type=int, default=0,
                         help="Random seed for reproducibility (default: %(default)s)")
@@ -965,6 +1136,17 @@ def main():
 
     print(f"Train instances: {len(train_files)}, Valid instances: {len(valid_files)}")
     print(f"Batch size: {batch_size}")
+
+    # Determine objective sense (minimize or maximize)
+    first_data = train_data[0]
+    if hasattr(first_data, 'obj_sense_min'):
+        is_minimize = bool(first_data.obj_sense_min.item())
+    else:
+        _raw = extract_raw_ilp(train_files[0])
+        is_minimize = _raw['obj_sense_min']
+    obj_sign = 1.0 if is_minimize else -1.0
+    opt_dir = "MINIMIZE" if is_minimize else "MAXIMIZE"
+    print(f"Objective sense: {opt_dir}")
 
     # ---- Model ----
     model = GNNPolicy(
@@ -1044,30 +1226,45 @@ def main():
 
     # ---- Training ----
     best_val_xi_sum = float('inf')
-    best_val_obj = float('inf')
+    best_val_obj = float('inf') if is_minimize else float('-inf')
     best_feasible = False  # whether best model satisfies xi threshold
     patience_counter = 0
     alm_frozen = False  # whether ALM params are frozen due to es_xi_threshold2
-    best_allfeas_obj = float('inf')  # best discrete obj when ALL val instances are feasible
+    sample_alm_frozen = False  # whether ALM params are frozen due to all-sample-feasible
+
+    # Restore frozen states from checkpoint if resuming
+    if args.resume_from is not None:
+        try:
+            alm_frozen = ckpt.get('alm_frozen', False)
+            sample_alm_frozen = ckpt.get('sample_alm_frozen', False)
+        except (NameError, AttributeError):
+            pass
+    best_allfeas_obj = float('inf') if is_minimize else float('-inf')  # best discrete obj when ALL val instances are feasible
+    best_sample_allfeas_obj = float('inf') if is_minimize else float('-inf')  # best sampling obj when ALL val instances have feasible samples
 
     # Resolve tau_min: 0 means disabled
     tau_min = args.tau_min if args.tau_min > 0 else None
 
     print(f"\n{'='*70}")
-    print(f"Starting Unsupervised ALM Training for {problem_type}")
+    print(f"Starting Unsupervised ALM Training for {problem_type} ({opt_dir})")
     print(f"  tau={args.tau}, tau_min={tau_min}, gamma_init={args.gamma_init}, rho_init={args.rho_init}")
     print(f"  inner_steps={args.inner_steps}, beta={args.beta}")
     print(f"  entropy_weight={args.entropy_weight}, grad_clip={args.grad_clip_norm}")
     print(f"  LR={args.lr}, schedule={args.lr_schedule}, warmup={args.warmup_epochs}")
+    print(f"  n_eval_samples={args.n_eval_samples}")
+    if args.freeze_on_all_sample_feasible:
+        print(f"  freeze_on_all_sample_feasible=True "
+              f"(freeze_gamma={args.freeze_gamma_on_feasible}, freeze_rho={args.freeze_rho_on_feasible})")
     print(f"{'='*70}\n")
 
     for epoch in range(start_epoch, args.num_epochs):
         t0 = time.time()
 
         # Train
-        freeze_lambda = alm_frozen
-        freeze_gamma = alm_frozen and args.freeze_gamma_on_feasible
-        freeze_rho = alm_frozen and args.freeze_rho_on_feasible
+        any_frozen = alm_frozen or sample_alm_frozen
+        freeze_lambda = any_frozen
+        freeze_gamma = any_frozen and args.freeze_gamma_on_feasible
+        freeze_rho = any_frozen and args.freeze_rho_on_feasible
         gamma, lambda_global, rho, prev_violation, step_counter, train_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, ema,
             gamma, args.tau, lambda_global, rho, prev_violation,
@@ -1090,6 +1287,7 @@ def main():
                 gamma, args.tau, lambda_global, rho,
                 args.entropy_weight, args.cons_normalize, device,
                 tau_min=tau_min,
+                n_eval_samples=args.n_eval_samples,
             )
 
             if ema is not None:
@@ -1098,7 +1296,7 @@ def main():
             # Save best model
             # Primary: xi_sum below threshold → feasible; secondary: lowest discrete objective per instance
             curr_xi = val_metrics['xi_sum_per_sample']
-            curr_obj = val_metrics['disc_obj_per_inst']
+            curr_obj_orig = val_metrics['disc_obj_per_inst'] * obj_sign  # original scale
             curr_feasible = curr_xi < args.es_xi_threshold
 
             is_best = False
@@ -1107,10 +1305,10 @@ def main():
                 is_best = True
             elif curr_feasible and best_feasible:
                 # Both feasible — save if objective improved
-                if curr_obj < best_val_obj - 1e-6:
+                if obj_is_better(curr_obj_orig, best_val_obj, is_minimize):
                     is_best = True
             elif not curr_feasible and not best_feasible:
-                
+
                 # Neither feasible — save if xi_sum improved
                 if curr_xi < best_val_xi_sum - 1e-6:
                     is_best = True
@@ -1118,7 +1316,7 @@ def main():
             if is_best:
                 best_feasible = curr_feasible
                 best_val_xi_sum = curr_xi
-                best_val_obj = curr_obj
+                best_val_obj = curr_obj_orig
                 patience_counter = 0
                 save_state = ema.state_dict(model) if ema is not None else model.state_dict()
                 torch.save(save_state, os.path.join(model_save_path, f'{save_name}_model_best.pth'))
@@ -1129,13 +1327,29 @@ def main():
             # ALL validation instances feasible after discretization + best discrete objective
             n_infeas = val_metrics['n_infeasible_inst']
             if n_infeas == 0:
-                if curr_obj < best_allfeas_obj - 1e-6:
-                    best_allfeas_obj = curr_obj
+                if obj_is_better(curr_obj_orig, best_allfeas_obj, is_minimize):
+                    best_allfeas_obj = curr_obj_orig
                     save_state = ema.state_dict(model) if ema is not None else model.state_dict()
                     af_path = os.path.join(model_save_path, f'{save_name}_model_best_allfeas.pth')
                     torch.save(save_state, af_path)
                     print(f"  [AllFeas] Saved best all-feasible model: "
-                          f"disc_obj/inst={curr_obj:.4f}, n_infeasible=0")
+                          f"disc_obj/inst={curr_obj_orig:.4f}, n_infeasible=0")
+
+            # Save best sampling-all-feasible model:
+            # ALL validation instances have at least one feasible sample + best average best feasible obj
+            if val_metrics.get('sample_total_samples', 0) > 0:
+                n_feas_inst_sample = val_metrics['sample_n_feasible_instances']
+                n_total_inst = val_metrics['n_valid_instances']
+                if n_feas_inst_sample == n_total_inst:
+                    curr_sample_obj = val_metrics['sample_best_feasible_obj'] * obj_sign
+                    if obj_is_better(curr_sample_obj, best_sample_allfeas_obj, is_minimize):
+                        best_sample_allfeas_obj = curr_sample_obj
+                        save_state = ema.state_dict(model) if ema is not None else model.state_dict()
+                        sf_path = os.path.join(model_save_path, f'{save_name}_model_best_sample.pth')
+                        torch.save(save_state, sf_path)
+                        print(f"  [SampleFeas] Saved best sampling-all-feasible model: "
+                              f"avg_best_feas_obj={curr_sample_obj:.4f}, "
+                              f"feas_inst={n_feas_inst_sample}/{n_total_inst}")
 
         # Check ALM freeze/unfreeze condition (can act on train or valid metrics)
         if args.es_xi_threshold2 is not None:
@@ -1170,6 +1384,29 @@ def main():
                               f"=> resuming all ALM updates "
                               f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
 
+        # Check ALM freeze/unfreeze based on sampling feasibility
+        if args.freeze_on_all_sample_feasible and val_metrics is not None:
+            if val_metrics.get('sample_total_samples', 0) > 0:
+                n_feas_inst_sample = val_metrics['sample_n_feasible_instances']
+                n_total_inst = val_metrics['n_valid_instances']
+                if n_feas_inst_sample == n_total_inst:
+                    if not sample_alm_frozen:
+                        sample_alm_frozen = True
+                        frozen_parts = ["lambda"]
+                        if args.freeze_gamma_on_feasible:
+                            frozen_parts.append("gamma")
+                        if args.freeze_rho_on_feasible:
+                            frozen_parts.append("rho")
+                        print(f"  [SampleFreeze] All {n_total_inst} val instances have feasible samples "
+                              f"=> freezing {', '.join(frozen_parts)} "
+                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
+                else:
+                    if sample_alm_frozen:
+                        sample_alm_frozen = False
+                        print(f"  [SampleUnfreeze] {n_total_inst - n_feas_inst_sample}/{n_total_inst} val instances "
+                              f"have no feasible samples => resuming all ALM updates "
+                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
+
         # Save latest (full checkpoint for resumable training)
         full_ckpt = {
             'model_state_dict': model.state_dict(),
@@ -1180,6 +1417,8 @@ def main():
             'lambda_global': lambda_global,
             'prev_violation': prev_violation,
             'step_counter': step_counter,
+            'alm_frozen': alm_frozen,
+            'sample_alm_frozen': sample_alm_frozen,
         }
         if scheduler is not None:
             full_ckpt['scheduler_state_dict'] = scheduler.state_dict()
@@ -1188,12 +1427,15 @@ def main():
         torch.save(full_ckpt, os.path.join(model_save_path, f'{save_name}_model_last.pth'))
 
         elapsed = time.time() - t0
-        log_str = format_metrics(train_metrics, val_metrics, epoch, elapsed)
+        log_str = format_metrics(train_metrics, val_metrics, epoch, elapsed, is_minimize)
         print(log_str)
         log_file.write(log_str + '\n')
         log_file.flush()
 
-        log_to_tensorboard(tb_writer, train_metrics, val_metrics, epoch)
+        log_to_tensorboard(tb_writer, train_metrics, val_metrics, epoch, is_minimize)
+        if tb_writer is not None:
+            tb_writer.add_scalar('ALM/ALM_Frozen', int(alm_frozen), epoch)
+            tb_writer.add_scalar('ALM/Sample_ALM_Frozen', int(sample_alm_frozen), epoch)
 
         # Early stopping based on patience
         if (val_metrics is not None
@@ -1201,7 +1443,7 @@ def main():
                 and epoch > args.patience):
             print(f"\nEarly stopping at epoch {epoch}: no improvement for {args.patience} epochs.")
             print(f"  Best XiSum/sample={best_val_xi_sum:.6f}  "
-                  f"Best AvgObj/sample={best_val_obj:.4f}  "
+                  f"Best AvgObj/sample={best_val_obj:.4f}({opt_dir})  "
                   f"Feasible={best_feasible}")
             break
 

@@ -62,8 +62,90 @@ def load_pretrained_model(args: argparse.Namespace, model_path: str, device: tor
             print(f"  {k}")
         print("  Inference results may be incorrect. Re-train or re-save the model with the fixed train.py.")
     model.eval()
-    
+
     return model
+
+
+# ============================================================
+#  Gumbel-Softmax Sampling Utilities
+# ============================================================
+
+def gumbel_sample(logits, N, tau=1.0):
+    """
+    Gumbel-Softmax sampling for differentiable binary decisions.
+
+    Args:
+        logits: [n_vars] raw logits from the GNN.
+        N: number of solutions to sample.
+        tau: Gumbel-Softmax temperature.
+
+    Returns:
+        [N, n_vars] binary samples (hard via straight-through estimator).
+    """
+    logits = logits.reshape(-1, 1)
+    logits = logits.repeat(N, 1, 1)                                  # [N, n_vars, 1]
+    logits = torch.cat([torch.zeros_like(logits), logits], dim=-1)    # [N, n_vars, 2]
+    return torch.nn.functional.gumbel_softmax(logits, tau=tau, hard=True)[:, :, 1]
+
+
+def build_dense_A(raw_cons_indices, raw_cons_values, n_cons, n_vars, device):
+    """Build dense constraint matrix A from sparse representation."""
+    A = torch.zeros(n_cons, n_vars, device=device)
+    row = raw_cons_indices[0].to(device)
+    col = raw_cons_indices[1].to(device)
+    val = raw_cons_values.to(device)
+    A[row, col] = val
+    return A
+
+
+@torch.no_grad()
+def evaluate_by_sampling_single(logits_raw, raw_ilp, n_eval_samples, device='cpu'):
+    """
+    Evaluate a single instance by sampling many solutions and finding the best feasible one.
+
+    Args:
+        logits_raw: [n_vars] raw logits (before sigmoid), in raw ILP variable order.
+        raw_ilp: dict from extract_raw_ilp with keys: cons_indices, cons_values, rhs, obj_coeffs, n_cons, n_vars.
+        n_eval_samples: number of samples.
+        device: torch device.
+
+    Returns:
+        best_feasible_obj: best objective among feasible solutions (inf if none).
+        best_obj: best objective among all solutions.
+        mean_obj: mean objective over all solutions.
+        mean_feasible_obj: mean objective among feasible solutions (inf if none).
+        n_feasible: number of feasible solutions found.
+    """
+    n_vars = raw_ilp['n_vars']
+    n_cons = raw_ilp['n_cons']
+
+    logits_raw = logits_raw.to(device)
+    A = build_dense_A(raw_ilp['cons_indices'], raw_ilp['cons_values'], n_cons, n_vars, device)
+    b = raw_ilp['rhs'].to(device).reshape(-1, 1)
+    c = raw_ilp['obj_coeffs'].to(device).reshape(-1, 1)
+
+    # Sample solutions
+    xx = gumbel_sample(logits_raw, n_eval_samples, tau=1.0).float().reshape(n_eval_samples, -1)
+
+    # Objectives for all samples
+    objs = (xx @ c).squeeze(-1)  # [n_eval_samples]
+
+    # Find feasible solutions: all constraints satisfied
+    violations = torch.relu(A @ xx.T - b).sum(dim=0)  # [n_eval_samples]
+    feasible_mask = (violations == 0)
+    n_feasible = feasible_mask.sum().item()
+
+    if n_feasible > 0:
+        best_feasible_obj = objs[feasible_mask].min().item()
+        mean_feasible_obj = objs[feasible_mask].mean().item()
+    else:
+        best_feasible_obj = float('inf')
+        mean_feasible_obj = float('inf')
+
+    best_obj = objs.min().item()
+    mean_obj = objs.mean().item()
+
+    return best_feasible_obj, best_obj, mean_obj, mean_feasible_obj, n_feasible
 
 
 def process_single_instance(args, ins_path, policy, device):
@@ -338,7 +420,7 @@ def run_inference_only(args, policy):
     dataset_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset')
     solution_dir = os.path.join(dataset_dir, args.test_problem_type, 'solution')
 
-    sum_feat, sum_infer, sum_total = 0.0, 0.0, 0.0
+    sum_feat, sum_infer, sum_sample, sum_total = 0.0, 0.0, 0.0, 0.0
     sum_conf_vars = 0
     count = 0
     conf_threshold = args.margin
@@ -353,6 +435,13 @@ def run_inference_only(args, policy):
     all_max_viol = []
     all_total_viol = []
     all_n_violated = []
+
+    # Sampling metrics accumulators
+    all_sample_best_feas_obj = []
+    all_sample_mean_feas_obj = []
+    all_sample_n_feasible = []
+    all_sample_best_obj = []
+    n_eval_samples = args.n_eval_samples
 
     for idx, ins_name in enumerate(test_instances):
         ins_path = os.path.join(args.instance_dir, args.test_problem_type, ins_name)
@@ -374,7 +463,7 @@ def run_inference_only(args, policy):
         feature_time = t1 - t0
 
         # ---- 2. GNN 推理 ----
-        BD = policy(
+        logits_out = policy(
             constraint_features.to(device),
             edge_indices.to(device),
             edge_features.to(device),
@@ -383,7 +472,8 @@ def run_inference_only(args, policy):
             constraint_features_batch,
             variable_features_batch
         )
-        BD = BD.sigmoid().cpu().squeeze()
+        BD = logits_out.sigmoid().cpu().squeeze()
+        logits_cpu = logits_out.cpu().squeeze()
         t2 = time.time()
         infer_time = t2 - t1
 
@@ -429,6 +519,24 @@ def run_inference_only(args, policy):
         all_max_viol.append(max_v)
         all_total_viol.append(total_v)
         all_n_violated.append(n_viol)
+
+        # ---- 3d. 采样评估 ----
+        sample_time = 0.0
+        best_feas_obj_s, best_obj_s, mean_obj_s, mean_feas_obj_s, n_feas_s = (
+            float('inf'), float('inf'), float('inf'), float('inf'), 0
+        )
+        if n_eval_samples > 0:
+            t_sample_start = time.time()
+            raw_ilp = extract_raw_ilp(ins_path)
+            best_feas_obj_s, best_obj_s, mean_obj_s, mean_feas_obj_s, n_feas_s = evaluate_by_sampling_single(
+                logits_cpu, raw_ilp, n_eval_samples, device='cpu'
+            )
+            sample_time = time.time() - t_sample_start
+            sum_sample += sample_time
+            all_sample_best_feas_obj.append(best_feas_obj_s)
+            all_sample_mean_feas_obj.append(mean_feas_obj_s)
+            all_sample_n_feasible.append(n_feas_s)
+            all_sample_best_obj.append(best_obj_s)
 
         # ---- 4. 启发式固定 + 加信赖域约束 + 导出新实例 ----
         #        用 pyscipopt 做模型 I/O（开源，无 license 限制）
@@ -477,11 +585,17 @@ def run_inference_only(args, policy):
         acc_str      = f"{acc_val:.4f}"      if not np.isnan(acc_val)      else "N/A"
         topk_acc_str = f"{topk_acc_val:.4f}" if not np.isnan(topk_acc_val) else "N/A"
         mse_str      = f"{mse_val:.4f}"      if not np.isnan(mse_val)      else "N/A"
+        sample_str = ""
+        if n_eval_samples > 0:
+            bfo_str = f"{best_feas_obj_s:.4f}" if best_feas_obj_s != float('inf') else "N/A"
+            sample_str = (f"  SampleFeas={n_feas_s}/{n_eval_samples}  "
+                          f"BestFeasObj={bfo_str}  sample={sample_time:.4f}s")
         print(f"[{idx+1}/{len(test_instances)}] {ins_name}  "
               f"binary={len(scores)}  fixed={n_fixed}  conf={n_conf}  delta={delta}  "
               f"CE={ce_str}  MSE={mse_str}  Acc={acc_str}  Top{args.topk}-Acc={topk_acc_str}  "
               f"Obj={obj_val_r:.4f}  MaxViol={max_v:.6f}  "
-              f"Violated={n_viol}/{n_total}  Feasible={'YES' if feas else 'NO'}  "
+              f"Violated={n_viol}/{n_total}  Feasible={'YES' if feas else 'NO'}"
+              f"{sample_str}  "
               f"feat={feature_time:.4f}s  infer={infer_time:.4f}s  "
               f"total={total_time:.4f}s  -> {os.path.basename(out_path)}")
 
@@ -493,6 +607,8 @@ def run_inference_only(args, policy):
               f"(total={sum_conf_vars})")
         print(f"  Feature extraction : total={sum_feat:.4f}s  avg={sum_feat/count:.4f}s")
         print(f"  GNN inference      : total={sum_infer:.4f}s  avg={sum_infer/count:.4f}s")
+        if n_eval_samples > 0:
+            print(f"  Sampling eval      : total={sum_sample:.4f}s  avg={sum_sample/count:.4f}s")
         print(f"  Overall            : total={sum_total:.4f}s  avg={sum_total/count:.4f}s")
         print(f"  Output directory   : {output_dir}")
 
@@ -549,6 +665,26 @@ def run_inference_only(args, policy):
             print(f"    Max Violation:     mean={viol_arr.mean():.6f}  max={viol_arr.max():.6f}")
             print(f"    Total time: {sum_total:.2f}s  Avg: {sum_total/count:.3f}s")
 
+        if n_eval_samples > 0 and all_sample_n_feasible:
+            s_nfeas_arr = np.array(all_sample_n_feasible)
+            s_bfobj_arr = np.array(all_sample_best_feas_obj)
+            s_bobj_arr = np.array(all_sample_best_obj)
+            s_mfobj_arr = np.array(all_sample_mean_feas_obj)
+            total_feas_samples = int(s_nfeas_arr.sum())
+            total_samples = n_eval_samples * len(all_sample_n_feasible)
+            n_feas_inst = int((s_nfeas_arr > 0).sum())
+
+            print(f"\n  Sampling Evaluation ({len(all_sample_n_feasible)} instances, {n_eval_samples} samples each):")
+            print(f"    Feasible instances (>=1 feasible sample): {n_feas_inst}/{len(all_sample_n_feasible)}")
+            print(f"    Total feasible samples: {total_feas_samples}/{total_samples}  "
+                  f"rate={total_feas_samples/max(total_samples,1):.4f}")
+            if n_feas_inst > 0:
+                feas_mask = s_nfeas_arr > 0
+                print(f"    Best feasible obj (over feasible instances): mean={s_bfobj_arr[feas_mask].mean():.4f}")
+                print(f"    Mean feasible obj (over feasible instances): mean={s_mfobj_arr[feas_mask].mean():.4f}")
+            print(f"    Best obj (all samples):  mean={s_bobj_arr.mean():.4f}")
+            print(f"    Sampling time: total={sum_sample:.4f}s  avg={sum_sample/len(all_sample_n_feasible):.4f}s")
+
         print(f"{'='*60}")
 
 
@@ -577,6 +713,14 @@ def run_unsupervised_eval(args, policy):
     all_total_viol = []
     all_n_violated = []
     sum_time = 0.0
+    sum_sample_time = 0.0
+    n_eval_samples = args.n_eval_samples
+
+    # Sampling metrics accumulators
+    all_sample_best_feas_obj = []
+    all_sample_mean_feas_obj = []
+    all_sample_n_feasible = []
+    all_sample_best_obj = []
 
     for idx, ins_name in enumerate(test_instances):
         ins_path = os.path.join(args.instance_dir, args.test_problem_type, ins_name)
@@ -597,7 +741,7 @@ def run_unsupervised_eval(args, policy):
         constraint_features_batch = torch.zeros(len(constraint_features), dtype=torch.long, device=device)
         variable_features_batch = torch.zeros(len(variable_features), dtype=torch.long, device=device)
 
-        BD = policy(
+        logits_out = policy(
             constraint_features.to(device),
             edge_indices.to(device),
             edge_features.to(device),
@@ -606,7 +750,8 @@ def run_unsupervised_eval(args, policy):
             constraint_features_batch,
             variable_features_batch,
         )
-        BD = BD.sigmoid().cpu().squeeze()
+        BD = logits_out.sigmoid().cpu().squeeze()
+        logits_cpu = logits_out.cpu().squeeze()
 
         # Map GNN output to variable names
         all_varname = list(v_map)
@@ -629,13 +774,34 @@ def run_unsupervised_eval(args, policy):
         all_total_viol.append(total_v)
         all_n_violated.append(n_viol)
 
+        # Sampling evaluation
+        sample_time = 0.0
+        best_feas_obj_s, n_feas_s = float('inf'), 0
+        if n_eval_samples > 0:
+            t_sample_start = time.time()
+            raw_ilp = extract_raw_ilp(ins_path)
+            best_feas_obj_s, best_obj_s, mean_obj_s, mean_feas_obj_s, n_feas_s = evaluate_by_sampling_single(
+                logits_cpu, raw_ilp, n_eval_samples, device='cpu'
+            )
+            sample_time = time.time() - t_sample_start
+            sum_sample_time += sample_time
+            all_sample_best_feas_obj.append(best_feas_obj_s)
+            all_sample_mean_feas_obj.append(mean_feas_obj_s)
+            all_sample_n_feasible.append(n_feas_s)
+            all_sample_best_obj.append(best_obj_s)
+
         # Polarization
         polar = ((BD < 0.05) | (BD > 0.95)).float().mean().item()
 
+        sample_str = ""
+        if n_eval_samples > 0:
+            bfo_str = f"{best_feas_obj_s:.4f}" if best_feas_obj_s != float('inf') else "N/A"
+            sample_str = (f"  SampleFeas={n_feas_s}/{n_eval_samples}  "
+                          f"BestFeasObj={bfo_str}  sample={sample_time:.4f}s")
         print(f"[{idx+1}/{len(test_instances)}] {ins_name}  "
               f"Obj={obj_val:.4f}  MaxViol={max_v:.6f}  "
               f"Violated={n_viol}/{n_total}  Feasible={'YES' if feas else 'NO'}  "
-              f"Polar={polar:.4f}  Time={elapsed:.3f}s")
+              f"Polar={polar:.4f}{sample_str}  Time={elapsed:.3f}s")
 
     if all_feas:
         feas_arr = np.array(all_feas)
@@ -666,6 +832,27 @@ def run_unsupervised_eval(args, policy):
 
         print(f"  Max Violation:     mean={viol_arr.mean():.6f}  max={viol_arr.max():.6f}")
         print(f"  Total time: {sum_time:.2f}s  Avg: {sum_time/len(all_feas):.3f}s")
+
+        if n_eval_samples > 0 and all_sample_n_feasible:
+            s_nfeas_arr = np.array(all_sample_n_feasible)
+            s_bfobj_arr = np.array(all_sample_best_feas_obj)
+            s_bobj_arr = np.array(all_sample_best_obj)
+            s_mfobj_arr = np.array(all_sample_mean_feas_obj)
+            total_feas_samples = int(s_nfeas_arr.sum())
+            total_samples = n_eval_samples * len(all_sample_n_feasible)
+            n_feas_inst_s = int((s_nfeas_arr > 0).sum())
+
+            print(f"\n  Sampling Evaluation ({len(all_sample_n_feasible)} instances, {n_eval_samples} samples each):")
+            print(f"    Feasible instances (>=1 feasible sample): {n_feas_inst_s}/{len(all_sample_n_feasible)}")
+            print(f"    Total feasible samples: {total_feas_samples}/{total_samples}  "
+                  f"rate={total_feas_samples/max(total_samples,1):.4f}")
+            if n_feas_inst_s > 0:
+                feas_mask_s = s_nfeas_arr > 0
+                print(f"    Best feasible obj (over feasible instances): mean={s_bfobj_arr[feas_mask_s].mean():.4f}")
+                print(f"    Mean feasible obj (over feasible instances): mean={s_mfobj_arr[feas_mask_s].mean():.4f}")
+            print(f"    Best obj (all samples):  mean={s_bobj_arr.mean():.4f}")
+            print(f"    Sampling time: total={sum_sample_time:.4f}s  avg={sum_sample_time/len(all_sample_n_feasible):.4f}s")
+
         print(f"{'='*60}")
 
 
@@ -730,6 +917,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--delta", type=int, default=200)
     parser.add_argument("--topk", type=int, default=500,
                         help="Top-K most confident binary variables for accuracy evaluation (default: 500)")
+    parser.add_argument("--n_eval_samples", type=int, default=500,
+                        help="Number of Gumbel-Softmax samples for sampling evaluation "
+                             "(0 = disabled) (default: 500)")
 
     return parser.parse_args()
 
