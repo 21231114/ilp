@@ -40,14 +40,13 @@ def process_files(mode, queue, input_dir, output_dirs, solver_class, settings):
         file_path = os.path.join(input_dir, filename)
 
         try:
-            print(f"[worker {pid}] Solving {filename} ...", flush=True)
-            t0 = _time.time()
-            # Solve instance
-            solution_data = solve_instance(mode, file_path, output_dirs['logs'],
-                                        solver_class, settings)
-            t1 = _time.time()
-            n_sols = len(solution_data.get('sols', []))
-            print(f"[worker {pid}] Solved {filename} in {t1-t0:.1f}s, {n_sols} solutions found", flush=True)
+            print(f"[worker {pid}] Processing {filename} (skip solving) ...", flush=True)
+            # Skip solving, use empty solution data
+            solution_data = {
+                'var_names': [],
+                'sols': [],
+                'objs': []
+            }
 
             # Generate bipartite graph data
             adjacency, var_map, var_nodes, cons_nodes, bin_vars = get_a_new2(file_path)

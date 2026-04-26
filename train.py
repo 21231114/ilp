@@ -166,6 +166,7 @@ def compute_alm_loss(
     tau_min=None,    # minimum value for tau_j(gamma); clamp tau_vec to this floor
     obj_margin_weight=1.0, # weight for margin term in objective function
     cons_loss_normalize=False, # use xi.mean() instead of xi.sum() for scale-invariant constraint cost
+    tau_scale=1.0,   # dynamic scaling factor for tau tolerance (reduced when model collapses)
 ):
     """
     Compute the full Augmented Lagrangian loss.
@@ -246,7 +247,7 @@ def compute_alm_loss(
     sqrt_u_0 = math.exp(-gamma / 2.0 * (tau_x0 - 0.5) ** 2)
     sum_abs_A = torch.zeros(n_cons, device=device)
     sum_abs_A.scatter_add_(0, cons_row, abs_cons_val)
-    tau_vec = K * sqrt_u_0 * sum_abs_A
+    tau_vec = K * sqrt_u_0 * sum_abs_A * tau_scale
 
     # Clamp tau_vec to tau_min floor
     if tau_min is not None:
@@ -449,7 +450,12 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
                 device, step_counter,
                 freeze_lambda=False, freeze_gamma=False, freeze_rho=False,
                 tau_min=None, obj_margin_weight=1.0, cons_loss_normalize=False,
-                lambda_ema_alpha=1.0):
+                lambda_ema_alpha=1.0,
+                update_mode='alm',
+                lambda_lr=1.0, target_violation=0.1,
+                lambda_max=1000.0, lambda_min=0.0, rho_min=0.01,
+                lambda_delta_max=5.0, tau_scale=1.0,
+                freeze_tau_scale=False):
     """
     One epoch of ALM training with inner/outer loop.
 
@@ -516,6 +522,7 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
             tau_min=tau_min,
             obj_margin_weight=obj_margin_weight,
             cons_loss_normalize=cons_loss_normalize,
+            tau_scale=tau_scale,
         )
 
         # Normalize by number of graphs in batch
@@ -566,8 +573,8 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         n_batches += 1
         step_counter += 1
 
-        # --- Outer loop update ---
-        if step_counter % inner_steps == 0:
+        # --- Outer loop update (ALM mode only) ---
+        if update_mode == 'alm' and step_counter % inner_steps == 0:
             with torch.no_grad():
                 curr_viol = xi.sum().item() / max(batch.num_graphs, 1)
                 # EMA smoothing of violation for lambda update
@@ -591,6 +598,59 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
 
     n_batches = max(n_batches, 1)
     total_num_graphs = max(total_num_graphs, 1)
+
+    # --- Epoch-level adaptive update (adaptive mode only) ---
+    if update_mode == 'adaptive':
+        with torch.no_grad():
+            avg_disc_viol = total_discrete_viol / total_num_graphs
+
+            # Collapse detection: ALL training instances infeasible after rounding.
+            all_infeasible = (total_feasible_inst == 0)
+
+            if not freeze_lambda:
+                if all_infeasible:
+                    # Infeasible: INCREASE lambda to strengthen constraint enforcement.
+                    # Also REDUCE tau_scale so that the margin tolerance shrinks,
+                    # making xi > 0 and giving lambda/rho actual gradient signal.
+                    lambda_global = min(lambda_global + lambda_delta_max, lambda_max)
+                else:
+                    # Normal bidirectional update with clamped step size.
+                    raw_delta = lambda_lr * (avg_disc_viol - target_violation)
+                    clamped_delta = max(min(raw_delta, lambda_delta_max), -lambda_delta_max)
+                    lambda_global = lambda_global + clamped_delta
+                    lambda_global = max(min(lambda_global, lambda_max), lambda_min)
+
+            if not freeze_rho:
+                if all_infeasible:
+                    # Infeasible: increase rho (bounded) for stronger quadratic penalty.
+                    rho = min(rho * beta, rho_max)
+                else:
+                    if avg_disc_viol > target_violation * 2 and avg_disc_viol > 1e-4:
+                        rho = min(rho * beta, rho_max)
+                    elif avg_disc_viol < target_violation * 0.5 and rho > rho_min:
+                        rho = max(rho / beta, rho_min)
+
+            # Dynamic tau_scale: the key mechanism to prevent death spirals.
+            # When xi=0 (tau absorbs all violations), lambda*0 + rho*0 = 0,
+            # so increasing lambda/rho alone provides NO gradient signal.
+            # Reducing tau_scale makes tau smaller → xi becomes non-zero →
+            # the penalty terms produce useful gradients.
+            if not freeze_tau_scale:
+                if all_infeasible:
+                    tau_scale = max(tau_scale * 0.5, 0.01)
+                else:
+                    # Gradually restore tau_scale when feasibility improves,
+                    # but only partially — don't snap back to 1.0 instantly.
+                    feas_ratio = total_feasible_inst / total_num_graphs
+                    if feas_ratio > 0.5:
+                        tau_scale = min(tau_scale * 1.2, 1.0)
+
+            # Gamma: linear annealing per epoch
+            if not freeze_gamma:
+                gamma = min(gamma + delta_gamma, gamma_max)
+
+            prev_violation = avg_disc_viol
+
     metrics = {
         'loss_total': total_loss / n_batches,
         'objective_margin': total_f_tilde / n_batches,
@@ -606,6 +666,7 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         'rho': rho,
         'lambda_global': lambda_global,
         'K_gamma': compute_K(gamma),
+        'tau_scale': tau_scale,
         # Per-instance continuous metrics
         'obj_margin_per_inst': total_f_tilde / total_num_graphs,
         'obj_raw_per_inst': total_f_base / total_num_graphs,
@@ -619,13 +680,14 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         'n_infeasible_inst': total_infeasible_inst,
     }
 
-    return gamma, lambda_global, rho, prev_violation, step_counter, metrics
+    return gamma, lambda_global, rho, prev_violation, step_counter, tau_scale, metrics
 
 
 @torch.no_grad()
 def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
                    entropy_weight, cons_normalize, device, tau_min=None,
-                   n_eval_samples=0, obj_margin_weight=1.0, cons_loss_normalize=False):
+                   n_eval_samples=0, obj_margin_weight=1.0, cons_loss_normalize=False,
+                   tau_scale=1.0):
     """
     Validate: compute ALM loss + discrete rounding metrics + sampling metrics.
     """
@@ -696,6 +758,7 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
             tau_min=tau_min,
             obj_margin_weight=obj_margin_weight,
             cons_loss_normalize=cons_loss_normalize,
+            tau_scale=tau_scale,
         )
         loss = loss / max(batch.num_graphs, 1)
 
@@ -778,8 +841,8 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         'n_feasible_inst': total_feasible_inst,
         'n_infeasible_inst': total_infeasible_inst,
         # Sampling metrics
-        'sample_best_feasible_obj': sample_best_feasible_sum / max(sample_n_feasible_instances, 1),
-        'sample_mean_feasible_obj': sample_mean_feasible_obj_sum / max(sample_n_feasible_instances, 1),
+        'sample_best_feasible_obj': sample_best_feasible_sum / sample_n_feasible_instances if sample_n_feasible_instances > 0 else float('inf'),
+        'sample_mean_feasible_obj': sample_mean_feasible_obj_sum / sample_n_feasible_instances if sample_n_feasible_instances > 0 else float('inf'),
         'sample_best_obj': sample_best_obj_sum / total_num_graphs,
         'sample_mean_obj': sample_mean_obj_sum / total_num_graphs,
         'sample_feasible_rate': sample_total_feasible / max(sample_total_samples, 1),
@@ -814,7 +877,8 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed, is_minimize=True)
         f"  [ALM]   gamma={train_metrics['gamma']:.2f}  "
         f"rho={train_metrics['rho']:.4f}  "
         f"lambda={train_metrics['lambda_global']:.4f}  "
-        f"K(gamma)={train_metrics['K_gamma']:.6f}",
+        f"K(gamma)={train_metrics['K_gamma']:.6f}  "
+        f"tau_scale={train_metrics.get('tau_scale', 1.0):.4f}",
         # Train discrete per-instance
         f"  [TDisc] AvgObj/inst={train_metrics['disc_obj_per_inst'] * obj_sign:.4f}{opt_label}  "
         f"AvgViol/inst={train_metrics['disc_viol_per_inst']:.6f}  "
@@ -864,9 +928,13 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed, is_minimize=True)
         )
         # Sampling metrics
         if val_metrics.get('sample_total_samples', 0) > 0:
+            best_feas = val_metrics['sample_best_feasible_obj'] * obj_sign
+            mean_feas = val_metrics['sample_mean_feasible_obj'] * obj_sign
+            best_feas_str = f"{best_feas:.4f}" if not math.isinf(best_feas) else "N/A"
+            mean_feas_str = f"{mean_feas:.4f}" if not math.isinf(mean_feas) else "N/A"
             lines.append(
-                f"  [Sample] BestFeasObj={val_metrics['sample_best_feasible_obj'] * obj_sign:.4f}{opt_label}  "
-                f"MeanFeasObj={val_metrics['sample_mean_feasible_obj'] * obj_sign:.4f}{opt_label}  "
+                f"  [Sample] BestFeasObj={best_feas_str}{opt_label}  "
+                f"MeanFeasObj={mean_feas_str}{opt_label}  "
                 f"FeasRate={val_metrics['sample_feasible_rate']:.4f}  "
                 f"FeasInst={val_metrics['sample_n_feasible_instances']}/{val_metrics['n_valid_instances']}  "
                 f"FeasSamples={val_metrics['sample_total_feasible']}/{val_metrics['sample_total_samples']}"
@@ -900,6 +968,7 @@ def log_to_tensorboard(writer, train_metrics, val_metrics, epoch, is_minimize=Tr
     writer.add_scalar('ALM/Rho', train_metrics['rho'], epoch)
     writer.add_scalar('ALM/Lambda_Global', train_metrics['lambda_global'], epoch)
     writer.add_scalar('ALM/K_gamma', train_metrics['K_gamma'], epoch)
+    writer.add_scalar('ALM/Tau_Scale', train_metrics.get('tau_scale', 1.0), epoch)
 
     # New metrics
     writer.add_scalar('Prediction/Pred0_Ratio', train_metrics['pred0_ratio'], epoch)
@@ -984,7 +1053,7 @@ def get_parser():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-5,
                         help="L2 regularization (default: %(default)s)")
-    parser.add_argument("--num_epochs", type=int, default=5000)
+    parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=None,
                         help="Override task-specific batch size")
@@ -1029,7 +1098,7 @@ def get_parser():
                              "1.0 = no smoothing (original behavior), "
                              "0.3 = heavy smoothing to reduce oscillation "
                              "(default: %(default)s)")
-    parser.add_argument("--n_eval_samples", type=int, default=30,
+    parser.add_argument("--n_eval_samples", type=int, default=50,
                         help="Number of Gumbel-Softmax samples for validation sampling evaluation "
                              "(0 = disabled) (default: %(default)s)")
     parser.add_argument("--cons_normalize", action='store_true', default=True,
@@ -1091,9 +1160,38 @@ def get_parser():
                              "has no feasible samples. Requires --n_eval_samples > 0. "
                              "Use --freeze_gamma_on_feasible and --freeze_rho_on_feasible "
                              "to also freeze gamma and rho.")
+    parser.add_argument("--freeze_tau_scale_on_feasible", action='store_true', default=False,
+                        help="Also freeze tau_scale when ALM params are frozen due to "
+                             "feasibility (es_xi_threshold2 or freeze_on_all_sample_feasible). "
+                             "Prevents tau tolerance from drifting while other params are locked.")
 
     parser.add_argument("--seed", type=int, default=0,
                         help="Random seed for reproducibility (default: %(default)s)")
+
+    # ---- Adaptive update mode (DiffILO-inspired) ----
+    parser.add_argument("--update_mode", choices=['alm', 'adaptive'], default='alm',
+                        help="Parameter update mode: 'alm' = standard ALM outer loop, "
+                             "'adaptive' = bidirectional DiffILO-style update using raw "
+                             "constraint violations (default: %(default)s)")
+    parser.add_argument("--lambda_lr", type=float, default=1.0,
+                        help="[adaptive] Step size for lambda update: "
+                             "lambda += lambda_lr * (avg_raw_viol - target_violation) "
+                             "(default: %(default)s)")
+    parser.add_argument("--target_violation", type=float, default=0.1,
+                        help="[adaptive] Target raw violation level per instance. "
+                             "Lambda increases when above target, decreases when below. "
+                             "Set > 0 to allow bidirectional updates (default: %(default)s)")
+    parser.add_argument("--lambda_max", type=float, default=1000.0,
+                        help="[adaptive] Maximum lambda value (default: %(default)s)")
+    parser.add_argument("--lambda_min", type=float, default=0.0,
+                        help="[adaptive] Minimum lambda value (default: %(default)s)")
+    parser.add_argument("--rho_min", type=float, default=0.01,
+                        help="[adaptive] Minimum rho value for rho decay "
+                             "(default: %(default)s)")
+    parser.add_argument("--lambda_delta_max", type=float, default=5.0,
+                        help="[adaptive] Maximum per-epoch change in lambda. "
+                             "Prevents instant saturation when discrete violation "
+                             "is much larger than target (default: %(default)s)")
 
     return parser
 
@@ -1124,6 +1222,8 @@ def main():
         f'_cln{args.cons_loss_normalize}'
         f'_lema{args.lambda_ema_alpha}'
     )
+    if args.update_mode == 'adaptive':
+        save_name += f'_adaptive_llr{args.lambda_lr}_tv{args.target_violation}'
 
     # Create directories
     model_save_path = os.path.join(args.model_save_dir, problem_type)
@@ -1230,6 +1330,7 @@ def main():
     prev_violation = float('inf')
     step_counter = 0
     start_epoch = 0
+    tau_scale = 1.0  # dynamic tau tolerance scaling (reduced on collapse, restored on recovery)
 
     # ---- Resume from checkpoint ----
     if args.resume_from is not None:
@@ -1250,9 +1351,10 @@ def main():
             lambda_global = ckpt.get('lambda_global', lambda_global)
             prev_violation = ckpt.get('prev_violation', prev_violation)
             step_counter = ckpt.get('step_counter', step_counter)
+            tau_scale = ckpt.get('tau_scale', tau_scale)
             start_epoch = ckpt.get('epoch', 0) + 1
             print(f"  Resumed full checkpoint: epoch={start_epoch}, gamma={gamma:.2f}, "
-                  f"rho={rho:.4f}, lambda={lambda_global:.4f}")
+                  f"rho={rho:.4f}, lambda={lambda_global:.4f}, tau_scale={tau_scale:.4f}")
         else:
             # Plain state_dict (model weights only)
             model.load_state_dict(ckpt)
@@ -1281,15 +1383,22 @@ def main():
 
     print(f"\n{'='*70}")
     print(f"Starting Unsupervised ALM Training for {problem_type} ({opt_dir})")
+    print(f"  update_mode={args.update_mode}")
     print(f"  tau={args.tau}, tau_min={tau_min}, gamma_init={args.gamma_init}, rho_init={args.rho_init}")
     print(f"  inner_steps={args.inner_steps}, beta={args.beta}")
     print(f"  entropy_weight={args.entropy_weight}, obj_margin_weight={args.obj_margin_weight}, grad_clip={args.grad_clip_norm}")
     print(f"  cons_loss_normalize={args.cons_loss_normalize}, lambda_ema_alpha={args.lambda_ema_alpha}")
     print(f"  LR={args.lr}, schedule={args.lr_schedule}, warmup={args.warmup_epochs}")
     print(f"  n_eval_samples={args.n_eval_samples}")
+    if args.update_mode == 'adaptive':
+        print(f"  [adaptive] lambda_lr={args.lambda_lr}, target_violation={args.target_violation}, "
+              f"lambda_delta_max={args.lambda_delta_max}")
+        print(f"  [adaptive] lambda_range=[{args.lambda_min}, {args.lambda_max}], rho_min={args.rho_min}")
     if args.freeze_on_all_sample_feasible:
         print(f"  freeze_on_all_sample_feasible=True "
-              f"(freeze_gamma={args.freeze_gamma_on_feasible}, freeze_rho={args.freeze_rho_on_feasible})")
+              f"(freeze_gamma={args.freeze_gamma_on_feasible}, "
+              f"freeze_rho={args.freeze_rho_on_feasible}, "
+              f"freeze_tau_scale={args.freeze_tau_scale_on_feasible})")
     print(f"{'='*70}\n")
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -1300,7 +1409,8 @@ def main():
         freeze_lambda = any_frozen
         freeze_gamma = any_frozen and args.freeze_gamma_on_feasible
         freeze_rho = any_frozen and args.freeze_rho_on_feasible
-        gamma, lambda_global, rho, prev_violation, step_counter, train_metrics = train_epoch(
+        freeze_tau_scale = any_frozen and args.freeze_tau_scale_on_feasible
+        gamma, lambda_global, rho, prev_violation, step_counter, tau_scale, train_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, ema,
             gamma, args.tau, lambda_global, rho, prev_violation,
             args.inner_steps, args.beta, args.rho_max, args.gamma_max, args.delta_gamma,
@@ -1310,6 +1420,13 @@ def main():
             tau_min=tau_min, obj_margin_weight=args.obj_margin_weight,
             cons_loss_normalize=args.cons_loss_normalize,
             lambda_ema_alpha=args.lambda_ema_alpha,
+            update_mode=args.update_mode,
+            lambda_lr=args.lambda_lr, target_violation=args.target_violation,
+            lambda_max=args.lambda_max, lambda_min=args.lambda_min,
+            rho_min=args.rho_min,
+            lambda_delta_max=args.lambda_delta_max,
+            tau_scale=tau_scale,
+            freeze_tau_scale=freeze_tau_scale,
         )
 
         # Validate periodically
@@ -1327,6 +1444,7 @@ def main():
                 n_eval_samples=args.n_eval_samples,
                 obj_margin_weight=args.obj_margin_weight,
                 cons_loss_normalize=args.cons_loss_normalize,
+                tau_scale=tau_scale,
             )
 
             if ema is not None:
@@ -1413,15 +1531,17 @@ def main():
                             frozen_parts.append("gamma")
                         if args.freeze_rho_on_feasible:
                             frozen_parts.append("rho")
+                        if args.freeze_tau_scale_on_feasible:
+                            frozen_parts.append("tau_scale")
                         print(f"  [Freeze] {freeze_src} xi_sum/sample={freeze_xi:.6f} < threshold2={args.es_xi_threshold2} "
                               f"=> freezing {', '.join(frozen_parts)} "
-                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
+                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f}, tau_scale={tau_scale:.4f})")
                 else:
                     if alm_frozen:
                         alm_frozen = False
                         print(f"  [Unfreeze] {freeze_src} xi_sum/sample={freeze_xi:.6f} >= threshold2={args.es_xi_threshold2} "
                               f"=> resuming all ALM updates "
-                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
+                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f}, tau_scale={tau_scale:.4f})")
 
         # Check ALM freeze/unfreeze based on sampling feasibility
         if args.freeze_on_all_sample_feasible and val_metrics is not None:
@@ -1436,15 +1556,17 @@ def main():
                             frozen_parts.append("gamma")
                         if args.freeze_rho_on_feasible:
                             frozen_parts.append("rho")
+                        if args.freeze_tau_scale_on_feasible:
+                            frozen_parts.append("tau_scale")
                         print(f"  [SampleFreeze] All {n_total_inst} val instances have feasible samples "
                               f"=> freezing {', '.join(frozen_parts)} "
-                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
+                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f}, tau_scale={tau_scale:.4f})")
                 else:
                     if sample_alm_frozen:
                         sample_alm_frozen = False
                         print(f"  [SampleUnfreeze] {n_total_inst - n_feas_inst_sample}/{n_total_inst} val instances "
                               f"have no feasible samples => resuming all ALM updates "
-                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
+                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f}, tau_scale={tau_scale:.4f})")
 
         # Save latest (full checkpoint for resumable training)
         full_ckpt = {
@@ -1456,6 +1578,7 @@ def main():
             'lambda_global': lambda_global,
             'prev_violation': prev_violation,
             'step_counter': step_counter,
+            'tau_scale': tau_scale,
             'alm_frozen': alm_frozen,
             'sample_alm_frozen': sample_alm_frozen,
         }
