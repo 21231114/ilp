@@ -1,0 +1,186 @@
+TensorBoard logging to ./tb_logs/SC/ALM_tau0.9_taumin0.99_gamma0.0_rho1.0_inner20_ent0.01_ICCFalse_esxi1.0_esxi2None_t2onvalid_omw1.0_clnFalse_lema1.0
+Train instances: 240, Valid instances: 60
+Batch size: 1
+Objective sense: MINIMIZE
+
+======================================================================
+Starting Unsupervised ALM Training for SC (MINIMIZE)
+  tau=0.9, tau_min=0.99, gamma_init=0.0, rho_init=1.0
+  inner_steps=20, beta=1.5
+  entropy_weight=0.01, obj_margin_weight=1.0, grad_clip=1.0
+  cons_loss_normalize=False, lambda_ema_alpha=1.0
+  LR=0.0001, schedule=cosine, warmup=10
+  n_eval_samples=100
+======================================================================
+
+  [AllFeas] Saved best all-feasible model: disc_obj/inst=67837.4000, n_infeasible=0
+  [SampleFeas] Saved best sampling-all-feasible model: avg_best_feas_obj=120105.5667, feas_inst=60/60
+@epoch0  TIME:29.2s
+  [Train] Loss=0.988024  Obj_margin=247611.1495  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=12285.430430  Entropy=0.6921
+  [Pred]  Pred0=0.8439  Pred1=0.1561  Xi_mean/cons=4.095143  Tau_mean=101.273897
+  [ALM]   gamma=6.00  rho=1.0000  lambda=0.0000  K(gamma)=0.500000
+  [TDisc] AvgObj/inst=28837.0542↓  AvgViol/inst=1466.945833  FeasInst=116  InfeasInst=124
+  [TCont] ObjMargin/inst=247611.1495  ObjRaw/inst=121660.2974  Xi_m_t/inst=0.000000  Xi_raw/inst=0.000000  Xi_m/inst=12285.430430
+  [Valid] Loss=1.003529  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=4489.514339  AvgObj/s=67837.4000↓
+  [VPred] Pred0=0.6363  Pred1=0.3637  Xi_mean/cons=1.496505  Tau_mean=77.347923
+  [Disc]  Feasibility=1.0000  Objective=67837.4000↓  Polarization=0.0000  Uncertainty=0.9999
+  [VDisc] AvgObj/inst=67837.4000↓  AvgViol/inst=0.000000  FeasInst=60  InfeasInst=0
+  [VCont] ObjMargin/inst=251569.3388  ObjRaw/inst=125367.3973  Xi_m_t/inst=0.000000  Xi_raw/inst=0.000000  Xi_m/inst=4489.514339
+  [Sample] BestFeasObj=120105.5667↓  MeanFeasObj=125395.0388↓  FeasRate=1.0000  FeasInst=60/60  FeasSamples=6000/6000
+@epoch1  TIME:23.8s
+  [Train] Loss=0.701481  Obj_margin=175487.2580  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=62702.629232  Entropy=0.6070
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=20.900876  Tau_mean=62.666606
+  [ALM]   gamma=12.00  rho=1.0000  lambda=0.0000  K(gamma)=0.500000
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=175487.2580  ObjRaw/inst=75977.0548  Xi_m_t/inst=0.000000  Xi_raw/inst=0.000000  Xi_m/inst=62702.629232
+@epoch2  TIME:24.0s
+  [Train] Loss=0.139607  Obj_margin=34879.3584  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=56697.799023  Entropy=0.1502
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=18.899266  Tau_mean=38.777055
+  [ALM]   gamma=18.00  rho=1.0000  lambda=0.0000  K(gamma)=0.500000
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=34879.3584  ObjRaw/inst=8157.0135  Xi_m_t/inst=0.000000  Xi_raw/inst=0.051440  Xi_m/inst=56697.799023
+@epoch3  TIME:24.1s
+  [Train] Loss=0.043927  Obj_margin=11046.1016  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=33147.207658  Entropy=0.0157
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=11.049069  Tau_mean=26.221998
+  [ALM]   gamma=24.00  rho=1.0000  lambda=0.0000  K(gamma)=0.682850
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=11046.1016  ObjRaw/inst=396.2931  Xi_m_t/inst=0.000000  Xi_raw/inst=1277.857832  Xi_m/inst=33147.207658
+  [SampleFeas] Saved best sampling-all-feasible model: avg_best_feas_obj=39622.6833, feas_inst=60/60
+@epoch4  TIME:28.1s
+  [Train] Loss=0.031007  Obj_margin=7810.1514  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=25349.217244  Entropy=0.0061
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=8.449739  Tau_mean=25.145502
+  [ALM]   gamma=30.00  rho=1.0000  lambda=0.0000  K(gamma)=1.127847
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=7810.1514  ObjRaw/inst=123.2540  Xi_m_t/inst=0.000000  Xi_raw/inst=2417.760780  Xi_m/inst=25349.217244
+  [Valid] Loss=2.953441  MaxViol=0.066836  MeanViol=0.040075  XiSum/s=106901.522526  AvgObj/s=0.0000↓
+  [VPred] Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=35.633841  Tau_mean=25.578995
+  [Disc]  Feasibility=0.0000  Objective=0.0000↓  Polarization=0.0000  Uncertainty=0.6246
+  [VDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=60
+  [VCont] ObjMargin/inst=111098.7387  ObjRaw/inst=43227.9715  Xi_m_t/inst=120.223538  Xi_raw/inst=0.000000  Xi_m/inst=106901.522526
+  [Sample] BestFeasObj=39622.6833↓  MeanFeasObj=43253.6606↓  FeasRate=1.0000  FeasInst=60/60  FeasSamples=6000/6000
+@epoch5  TIME:24.0s
+  [Train] Loss=0.024527  Obj_margin=6182.3016  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=20982.077954  Entropy=0.0030
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=6.994026  Tau_mean=26.362496
+  [ALM]   gamma=36.00  rho=1.0000  lambda=0.0000  K(gamma)=1.959850
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=6182.3016  ObjRaw/inst=55.4807  Xi_m_t/inst=0.000000  Xi_raw/inst=2734.620678  Xi_m/inst=20982.077954
+@epoch6  TIME:23.6s
+  [Train] Loss=0.020348  Obj_margin=5131.1046  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=18042.861401  Entropy=0.0017
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=6.014287  Tau_mean=28.816598
+  [ALM]   gamma=42.00  rho=1.0000  lambda=0.0000  K(gamma)=3.520277
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=5131.1046  ObjRaw/inst=29.3156  Xi_m_t/inst=0.000000  Xi_raw/inst=2861.487872  Xi_m/inst=18042.861401
+@epoch7  TIME:23.9s
+  [Train] Loss=0.017409  Obj_margin=4390.9895  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=15928.312980  Entropy=0.0011
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=5.309438  Tau_mean=32.401754
+  [ALM]   gamma=48.00  rho=1.0000  lambda=0.0000  K(gamma)=6.473218
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=4390.9895  ObjRaw/inst=17.2229  Xi_m_t/inst=0.000000  Xi_raw/inst=2919.574750  Xi_m/inst=15928.312980
+@epoch8  TIME:23.9s
+  [Train] Loss=0.015577  Obj_margin=3929.6761  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14602.806278  Entropy=0.0007
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.867602  Tau_mean=36.109345
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3929.6761  ObjRaw/inst=10.7787  Xi_m_t/inst=0.000000  Xi_raw/inst=2950.020743  Xi_m/inst=14602.806278
+@epoch9  TIME:27.9s
+  [Train] Loss=0.015416  Obj_margin=3889.5633  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14509.497595  Entropy=0.0005
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.836499  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3889.5633  ObjRaw/inst=7.1056  Xi_m_t/inst=0.000000  Xi_raw/inst=2967.411865  Xi_m/inst=14509.497595
+  [Valid] Loss=0.019077  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=13220.279574  AvgObj/s=0.0000↓
+  [VPred] Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.406760  Tau_mean=36.463104
+  [Disc]  Feasibility=0.0000  Objective=0.0000↓  Polarization=0.9961  Uncertainty=0.0129
+  [VDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=60
+  [VCont] ObjMargin/inst=4764.2269  ObjRaw/inst=593.6419  Xi_m_t/inst=0.000000  Xi_raw/inst=540.825387  Xi_m/inst=13220.279574
+  [Sample] BestFeasObj=0.0000↓  MeanFeasObj=0.0000↓  FeasRate=0.0000  FeasInst=0/60  FeasSamples=0/6000
+@epoch10  TIME:23.7s
+  [Train] Loss=0.015403  Obj_margin=3886.4593  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14515.664469  Entropy=0.0003
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.838555  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3886.4593  ObjRaw/inst=4.8642  Xi_m_t/inst=0.000000  Xi_raw/inst=2977.438721  Xi_m/inst=14515.664469
+@epoch11  TIME:23.8s
+  [Train] Loss=0.015394  Obj_margin=3884.6051  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14519.821680  Entropy=0.0002
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.839941  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3884.6051  ObjRaw/inst=3.5251  Xi_m_t/inst=0.000000  Xi_raw/inst=2984.196301  Xi_m/inst=14519.821680
+@epoch12  TIME:23.9s
+  [Train] Loss=0.015389  Obj_margin=3883.3629  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14522.004968  Entropy=0.0002
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.840668  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3883.3629  ObjRaw/inst=2.6279  Xi_m_t/inst=0.000000  Xi_raw/inst=2987.744740  Xi_m/inst=14522.004968
+@epoch13  TIME:23.8s
+  [Train] Loss=0.015385  Obj_margin=3882.5353  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14523.572164  Entropy=0.0002
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.841191  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3882.5353  ObjRaw/inst=2.0302  Xi_m_t/inst=0.000000  Xi_raw/inst=2990.290924  Xi_m/inst=14523.572164
+@epoch14  TIME:28.0s
+  [Train] Loss=0.015383  Obj_margin=3881.9537  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14524.972847  Entropy=0.0001
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.841658  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3881.9537  ObjRaw/inst=1.6101  Xi_m_t/inst=0.000000  Xi_raw/inst=2992.566865  Xi_m/inst=14524.972847
+  [Valid] Loss=0.015486  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14480.298503  AvgObj/s=0.0000↓
+  [VPred] Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.826766  Tau_mean=36.463104
+  [Disc]  Feasibility=0.0000  Objective=0.0000↓  Polarization=1.0000  Uncertainty=0.0004
+  [VDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=60
+  [VCont] ObjMargin/inst=3906.4684  ObjRaw/inst=18.6099  Xi_m_t/inst=0.000000  Xi_raw/inst=2919.003768  Xi_m/inst=14480.298503
+  [Sample] BestFeasObj=0.0000↓  MeanFeasObj=0.0000↓  FeasRate=0.0000  FeasInst=0/60  FeasSamples=0/6000
+@epoch15  TIME:24.0s
+  [Train] Loss=0.015381  Obj_margin=3881.5104  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14525.848002  Entropy=0.0001
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.841949  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3881.5104  ObjRaw/inst=1.2899  Xi_m_t/inst=0.000000  Xi_raw/inst=2993.988553  Xi_m/inst=14525.848002
+@epoch16  TIME:24.0s
+  [Train] Loss=0.015379  Obj_margin=3881.1823  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14526.288704  Entropy=0.0001
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.842096  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3881.1823  ObjRaw/inst=1.0529  Xi_m_t/inst=0.000000  Xi_raw/inst=2994.704601  Xi_m/inst=14526.288704
+@epoch17  TIME:24.0s
+  [Train] Loss=0.015378  Obj_margin=3880.9246  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14527.042855  Entropy=0.0001
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.842348  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3880.9246  ObjRaw/inst=0.8668  Xi_m_t/inst=0.000000  Xi_raw/inst=2995.930232  Xi_m/inst=14527.042855
+@epoch18  TIME:23.7s
+  [Train] Loss=0.015377  Obj_margin=3880.7196  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14527.480404  Entropy=0.0001
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.842493  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3880.7196  ObjRaw/inst=0.7187  Xi_m_t/inst=0.000000  Xi_raw/inst=2996.640533  Xi_m/inst=14527.480404
+@epoch19  TIME:27.8s
+  [Train] Loss=0.015377  Obj_margin=3880.5597  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14527.823299  Entropy=0.0000
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.842608  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3880.5597  ObjRaw/inst=0.6031  Xi_m_t/inst=0.000000  Xi_raw/inst=2997.195867  Xi_m/inst=14527.823299
+  [Valid] Loss=0.015390  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14522.250228  AvgObj/s=0.0000↓
+  [VPred] Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.840750  Tau_mean=36.463104
+  [Disc]  Feasibility=0.0000  Objective=0.0000↓  Polarization=1.0000  Uncertainty=0.0001
+  [VDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=60
+  [VCont] ObjMargin/inst=3884.3359  ObjRaw/inst=2.7501  Xi_m_t/inst=0.000000  Xi_raw/inst=2988.048527  Xi_m/inst=14522.250228
+  [Sample] BestFeasObj=0.0000↓  MeanFeasObj=0.0000↓  FeasRate=0.0000  FeasInst=0/60  FeasSamples=0/6000
+@epoch20  TIME:24.6s
+  [Train] Loss=0.015376  Obj_margin=3880.4357  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14528.155282  Entropy=0.0000
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.842718  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3880.4357  ObjRaw/inst=0.5136  Xi_m_t/inst=0.000000  Xi_raw/inst=2997.736383  Xi_m/inst=14528.155282
+@epoch21  TIME:24.0s
+  [Train] Loss=0.015375  Obj_margin=3880.3214  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14528.332035  Entropy=0.0000
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.842777  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3880.3214  ObjRaw/inst=0.4311  Xi_m_t/inst=0.000000  Xi_raw/inst=2998.023870  Xi_m/inst=14528.332035
+@epoch22  TIME:24.1s
+  [Train] Loss=0.015375  Obj_margin=3880.2323  MaxViol=0.000000  MeanViol=0.000000  XiSum/s=14528.468787  Entropy=0.0000
+  [Pred]  Pred0=1.0000  Pred1=0.0000  Xi_mean/cons=4.842823  Tau_mean=36.463104
+  [ALM]   gamma=50.00  rho=1.0000  lambda=0.0000  K(gamma)=7.963272
+  [TDisc] AvgObj/inst=0.0000↓  AvgViol/inst=3000.000000  FeasInst=0  InfeasInst=240
+  [TCont] ObjMargin/inst=3880.2323  ObjRaw/inst=0.3667  Xi_m_t/inst=0.000000  Xi_raw/inst=2998.244471  Xi_m/inst=14528.468787

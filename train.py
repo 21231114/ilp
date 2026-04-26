@@ -164,6 +164,8 @@ def compute_alm_loss(
     cons_norm_cache=None,  # optional per-constraint normalization factors
     entropy_weight=0.0,    # binary entropy regularization weight
     tau_min=None,    # minimum value for tau_j(gamma); clamp tau_vec to this floor
+    obj_margin_weight=1.0, # weight for margin term in objective function
+    cons_loss_normalize=False, # use xi.mean() instead of xi.sum() for scale-invariant constraint cost
 ):
     """
     Compute the full Augmented Lagrangian loss.
@@ -207,7 +209,7 @@ def compute_alm_loss(
     c = batch.obj_coeffs.to(device)
     f_base = (c * x_raw).sum()
     f_margin = K * (c.abs() * sqrt_u_raw).sum()
-    f_tilde = f_base + f_margin
+    f_tilde = f_base + obj_margin_weight * f_margin
 
     # Normalize objective by sum(|c_i|) for scale balance with constraints
     c_norm = c.abs().sum().clamp(min=1.0)
@@ -260,8 +262,12 @@ def compute_alm_loss(
     xi = torch.relu(raw_violation)
 
     # --- 5. Augmented Lagrangian loss ---
-    lagrangian_term = lambda_global * xi.sum()
-    penalty_term = (rho / 2.0) * (xi ** 2).sum()
+    if cons_loss_normalize and xi.numel() > 0:
+        lagrangian_term = lambda_global * xi.mean()
+        penalty_term = (rho / 2.0) * (xi ** 2).mean()
+    else:
+        lagrangian_term = lambda_global * xi.sum()
+        penalty_term = (rho / 2.0) * (xi ** 2).sum()
     loss = f_tilde_normalized + lagrangian_term + penalty_term
 
     # --- 6. Binary entropy regularization ---
@@ -442,7 +448,8 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
                 entropy_weight, cons_normalize, grad_clip_norm,
                 device, step_counter,
                 freeze_lambda=False, freeze_gamma=False, freeze_rho=False,
-                tau_min=None):
+                tau_min=None, obj_margin_weight=1.0, cons_loss_normalize=False,
+                lambda_ema_alpha=1.0):
     """
     One epoch of ALM training with inner/outer loop.
 
@@ -507,6 +514,8 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
             cons_norm_cache=cons_norm,
             entropy_weight=entropy_weight,
             tau_min=tau_min,
+            obj_margin_weight=obj_margin_weight,
+            cons_loss_normalize=cons_loss_normalize,
         )
 
         # Normalize by number of graphs in batch
@@ -561,9 +570,16 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         if step_counter % inner_steps == 0:
             with torch.no_grad():
                 curr_viol = xi.sum().item() / max(batch.num_graphs, 1)
+                # EMA smoothing of violation for lambda update
+                # Guard against prev_violation=inf on the first outer step:
+                # use curr_viol directly (no smoothing) when prev is uninitialized
+                if math.isinf(prev_violation):
+                    smoothed_viol = curr_viol
+                else:
+                    smoothed_viol = lambda_ema_alpha * curr_viol + (1 - lambda_ema_alpha) * prev_violation
                 # Update global lambda
                 if not freeze_lambda:
-                    lambda_global = max(0.0, lambda_global + rho * curr_viol)
+                    lambda_global = max(0.0, lambda_global + rho * smoothed_viol)
                 # Update rho if violations aren't decreasing fast enough
                 if not freeze_rho:
                     if curr_viol > 0.8 * prev_violation and curr_viol > 1e-4:
@@ -609,7 +625,7 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
 @torch.no_grad()
 def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
                    entropy_weight, cons_normalize, device, tau_min=None,
-                   n_eval_samples=0):
+                   n_eval_samples=0, obj_margin_weight=1.0, cons_loss_normalize=False):
     """
     Validate: compute ALM loss + discrete rounding metrics + sampling metrics.
     """
@@ -678,6 +694,8 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
             cons_norm_cache=cons_norm,
             entropy_weight=entropy_weight,
             tau_min=tau_min,
+            obj_margin_weight=obj_margin_weight,
+            cons_loss_normalize=cons_loss_normalize,
         )
         loss = loss / max(batch.num_graphs, 1)
 
@@ -990,15 +1008,28 @@ def get_parser():
                         help="Maximum rho (default: %(default)s)")
     parser.add_argument("--beta", type=float, default=1.5,
                         help="Rho amplification factor (default: %(default)s)")
-    parser.add_argument("--inner_steps", type=int, default=20,
+    parser.add_argument("--inner_steps", type=int, default=240,
                         help="Inner loop steps between ALM updates (default: %(default)s)")
 
     # Regularization & training tricks
     parser.add_argument("--grad_clip_norm", type=float, default=1.0,
                         help="Max gradient norm for clipping (0 = no clipping)")
-    parser.add_argument("--entropy_weight", type=float, default=0.01,
+    parser.add_argument("--entropy_weight", type=float, default=0.00,
                         help="Binary entropy regularization weight (default: %(default)s)")
-    parser.add_argument("--n_eval_samples", type=int, default=500,
+    parser.add_argument("--obj_margin_weight", type=float, default=0.3,
+                        help="Weight for margin term in objective function: "
+                             "f_tilde = f_base + obj_margin_weight * K * margin "
+                             "(default: %(default)s)")
+    parser.add_argument("--cons_loss_normalize", action='store_true', default=True,
+                        help="Use xi.mean() instead of xi.sum() for lagrangian and penalty terms, "
+                             "making constraint cost scale-invariant w.r.t. number of constraints "
+                             "(default: %(default)s)")
+    parser.add_argument("--lambda_ema_alpha", type=float, default=0.8,
+                        help="EMA smoothing factor for violation used in lambda update. "
+                             "1.0 = no smoothing (original behavior), "
+                             "0.3 = heavy smoothing to reduce oscillation "
+                             "(default: %(default)s)")
+    parser.add_argument("--n_eval_samples", type=int, default=30,
                         help="Number of Gumbel-Softmax samples for validation sampling evaluation "
                              "(0 = disabled) (default: %(default)s)")
     parser.add_argument("--cons_normalize", action='store_true', default=True,
@@ -1038,7 +1069,7 @@ def get_parser():
     # Early stopping
     parser.add_argument("--es_xi_threshold", type=float, default=1.0,
                         help="Early-stop feasibility threshold: avg sum_j xi_j per sample (default: %(default)s)")
-    parser.add_argument("--patience", type=int, default=50,
+    parser.add_argument("--patience", type=int, default=100,
                         help="Early-stop patience: epochs without improvement (default: %(default)s)")
 
     # ALM freezing: freeze lambda (and optionally gamma/rho) when xi_sum < threshold2
@@ -1089,6 +1120,9 @@ def main():
         f'_inner{args.inner_steps}_ent{args.entropy_weight}'
         f'_ICC{args.Intra_Constraint_Competitive}'
         f'_esxi{args.es_xi_threshold}_esxi2{args.es_xi_threshold2}_t2on{args.threshold2_on}'
+        f'_omw{args.obj_margin_weight}'
+        f'_cln{args.cons_loss_normalize}'
+        f'_lema{args.lambda_ema_alpha}'
     )
 
     # Create directories
@@ -1249,7 +1283,8 @@ def main():
     print(f"Starting Unsupervised ALM Training for {problem_type} ({opt_dir})")
     print(f"  tau={args.tau}, tau_min={tau_min}, gamma_init={args.gamma_init}, rho_init={args.rho_init}")
     print(f"  inner_steps={args.inner_steps}, beta={args.beta}")
-    print(f"  entropy_weight={args.entropy_weight}, grad_clip={args.grad_clip_norm}")
+    print(f"  entropy_weight={args.entropy_weight}, obj_margin_weight={args.obj_margin_weight}, grad_clip={args.grad_clip_norm}")
+    print(f"  cons_loss_normalize={args.cons_loss_normalize}, lambda_ema_alpha={args.lambda_ema_alpha}")
     print(f"  LR={args.lr}, schedule={args.lr_schedule}, warmup={args.warmup_epochs}")
     print(f"  n_eval_samples={args.n_eval_samples}")
     if args.freeze_on_all_sample_feasible:
@@ -1272,7 +1307,9 @@ def main():
             args.entropy_weight, args.cons_normalize, args.grad_clip_norm,
             device, step_counter,
             freeze_lambda=freeze_lambda, freeze_gamma=freeze_gamma, freeze_rho=freeze_rho,
-            tau_min=tau_min,
+            tau_min=tau_min, obj_margin_weight=args.obj_margin_weight,
+            cons_loss_normalize=args.cons_loss_normalize,
+            lambda_ema_alpha=args.lambda_ema_alpha,
         )
 
         # Validate periodically
@@ -1288,6 +1325,8 @@ def main():
                 args.entropy_weight, args.cons_normalize, device,
                 tau_min=tau_min,
                 n_eval_samples=args.n_eval_samples,
+                obj_margin_weight=args.obj_margin_weight,
+                cons_loss_normalize=args.cons_loss_normalize,
             )
 
             if ema is not None:
