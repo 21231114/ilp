@@ -12,7 +12,7 @@ import pickle
 
 device=torch.device("cpu")
 
-TASKS = ["IP","WA","CA","SC"]
+TASKS = ["IP","WA","CA","SC","2club"]
 
 def get_a_new2(ins_name):
     epsilon = 1e-6

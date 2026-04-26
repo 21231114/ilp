@@ -30,7 +30,7 @@ torch.sparse.check_sparse_tensor_invariants.disable()
 # ============================================================
 #  Task-specific defaults
 # ============================================================
-TASK_BATCH_SIZE = {'CA': 4, 'WA': 4, 'IP': 4, 'SC': 1, 'IS': 4}
+TASK_BATCH_SIZE = {'CA': 4, 'WA': 4, 'IP': 4, 'SC': 1, 'IS': 4, '2club': 1}
 
 
 # ============================================================
@@ -937,7 +937,10 @@ def main():
         print(f"TensorBoard logging to {tb_dir}")
 
     # ---- Data loading ----
+    # Try instance_dir/problem_type first; if it doesn't exist, use instance_dir directly
     ins_dir = os.path.join(args.instance_dir, problem_type)
+    if not os.path.isdir(ins_dir):
+        ins_dir = args.instance_dir
     all_instances = sorted([
         os.path.join(ins_dir, f)
         for f in os.listdir(ins_dir)
@@ -946,8 +949,13 @@ def main():
 
     random.shuffle(all_instances)
     split = int(0.8 * len(all_instances))
-    train_files = all_instances[:split]
-    valid_files = all_instances[split:]
+    # Single-instance case: use the same instance for both train and valid
+    if split == 0 or len(all_instances) == 1:
+        train_files = all_instances
+        valid_files = all_instances
+    else:
+        train_files = all_instances[:split]
+        valid_files = all_instances[split:]
 
     cache_dir = args.cache_dir
     if cache_dir is None:
