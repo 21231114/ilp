@@ -960,7 +960,6 @@ def main():
     cache_dir = args.cache_dir
     if cache_dir is None:
         cache_dir = os.path.join(args.log_save_dir, problem_type, 'unsup_cache')
-
     train_data = UnsupervisedGraphDataset(train_files, cache_dir=cache_dir)
     valid_data = UnsupervisedGraphDataset(valid_files, cache_dir=cache_dir)
 
