@@ -8,6 +8,10 @@
 - 训练日志、验证日志、测试日志里每个字段的含义；
 - 调参时优先看哪些指标、常见问题该从哪些参数入手。
 
+数据集中只有SC,CA和IS是整数规划问题，但是目前只跑了SC和CA  
+目前的运行参数设置：  
+SC:python train.py --problem_type SC --instance_dir /home/lmh/autodl-tmp/data/l2o_milp --num_epochs 5000 --device cuda:0 --tau 1.0 --tau_min 0.9999 --gamma_init 22 --delta_gamma 0.1 --gamma_max 900.0 --rho_init 1.0 --beta 1.1 --rho_max 10000.0 --inner_steps 240 --entropy_weight 0.0 --lr 1e-4 --es_xi_threshold 1.1 --es_xi_threshold2 1.1 --freeze_gamma_on_feasible --freeze_rho_on_feasible --patience 5000 --threshold2_on valid
+CA:python train.py --problem_type CA --instance_dir /home/lmh/autodl-tmp/data/l2o_milp --num_epochs 5000 --device cuda:0 --tau 1.0 --tau_min 0.9999 --gamma_init 5(也可能是-4,这个忘怎么设置了) --delta_gamma 0.05 --gamma_max 900.0 --rho_init 1.0 --beta 1.1 --rho_max 10000.0 --inner_steps 240 --entropy_weight 0.0 --lr 1e-4 --es_xi_threshold 1.1 --es_xi_threshold2 1.1 --freeze_gamma_on_feasible --freeze_rho_on_feasible --patience 5000 --threshold2_on valid
 核心代码位置：
 
 | 模块 | 文件 | 主要内容 |
