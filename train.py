@@ -66,127 +66,108 @@ def compute_state_uncertainty(x_hat, gamma):
 def compute_alm_loss(
     x_hat,           # [total_vars] GNN sigmoid output
     batch,           # PyG batch object
-    gamma,           # current gamma
-    tau_x0,          # reference point x_0 in (0,1) for per-constraint tau_j(gamma)
-    lambda_global,   # scalar global Lagrangian multiplier
-    rho,             # quadratic penalty parameter
+    gamma,           # retained for scheduler/log compatibility
+    tau,             # fixed uniform tolerance tau_j = tau
+    mu,              # scalar constraint penalty parameter
+    loss_config='sum',      # reduction/normalization mode for objective + violations
     cons_norm_cache=None,  # optional per-constraint normalization factors
-    entropy_weight=0.0,    # binary entropy regularization weight
-    tau_min=None,    # minimum value for tau_j(gamma); clamp tau_vec to this floor
+    entropy_weight=0.0,    # optional binary entropy regularization weight
+    tau_min=None,    # deprecated/ignored for fixed-tau loss
 ):
     """
-    Compute the full Augmented Lagrangian loss.
+    Compute the fixed-tau scalar-penalty loss:
 
-    tau_j(gamma) = K(gamma) * sqrt(u(x_0)) * sum_i |A_ji|  (per-constraint tolerance)
+        c^T x + 2 * sum_i |c_i| x_i(1-x_i)
+        + mu * configured_reduction_j ReLU(A_j x - b_j + 2 * sum_i |A_ji| x_i(1-x_i) - tau)
 
-    Returns:
-        loss:           total ALM loss (scalar)
-        f_tilde:        margin-aware objective value (scalar)
-        xi:             [total_cons] per-constraint violation vector (with tau)
-        xi_no_tau:      [total_cons] violation without tau (for threshold metrics)
-        max_violation:  scalar max violation
-        mean_violation: scalar mean violation
-        entropy_val:    scalar entropy regularization value
+    loss_config controls how the objective and constraint violations are reduced.
     """
     device = x_hat.device
-    K = compute_K(gamma)
 
-    # --- 1. State uncertainty ---
-    sqrt_u = compute_state_uncertainty(x_hat, gamma)
-
-    # --- 2. Map GNN outputs to raw ILP variable order ---
+    # --- 1. Map GNN outputs to raw ILP variable order ---
     # gnn_to_raw_map maps each GNN variable to its index in the raw ILP
     gnn_to_raw = batch.gnn_to_raw_map.to(device)
     n_raw_vars = batch.obj_coeffs.shape[0]
 
-    # Scatter GNN outputs to raw ILP order
     x_raw = torch.zeros(n_raw_vars, device=device)
-    sqrt_u_raw = torch.zeros(n_raw_vars, device=device)
     count_raw = torch.zeros(n_raw_vars, device=device)
 
     x_raw.scatter_add_(0, gnn_to_raw, x_hat)
-    sqrt_u_raw.scatter_add_(0, gnn_to_raw, sqrt_u)
     count_raw.scatter_add_(0, gnn_to_raw, torch.ones_like(x_hat))
-    # Avoid division by zero for unmapped variables
     count_raw = count_raw.clamp(min=1)
     x_raw = x_raw / count_raw
-    sqrt_u_raw = sqrt_u_raw / count_raw
+    binary_relax = x_raw * (1.0 - x_raw)
 
-    # --- 3. Margin-aware objective ---
+    # --- 2. Objective: c^T x + 2 * sum_i |c_i| x_i(1-x_i) ---
     c = batch.obj_coeffs.to(device)
     f_base = (c * x_raw).sum()
-    f_margin = K * (c.abs() * sqrt_u_raw).sum()
+    f_margin = 2.0 * (c.abs() * binary_relax).sum()
     f_tilde = f_base + f_margin
 
-    # Normalize objective by sum(|c_i|) for scale balance with constraints
-    c_norm = c.abs().sum().clamp(min=1.0)
-    f_tilde_normalized = f_tilde / c_norm
-
-    # --- 4. Constraint violations with margin and tolerance ---
+    # --- 3. Constraint violations with fixed uniform tau ---
     cons_idx = batch.raw_cons_indices.to(device)   # [2, n_edges]
     cons_val = batch.raw_cons_values.to(device)     # [n_edges]
     rhs = batch.raw_rhs.to(device)                  # [n_cons]
     n_cons = rhs.shape[0]
 
-    cons_row = cons_idx[0]  # constraint indices
-    cons_col = cons_idx[1]  # variable indices
+    cons_row = cons_idx[0]
+    cons_col = cons_idx[1]
 
-    # A_j @ x_hat
     Ax_per_edge = cons_val * x_raw[cons_col]
     Ax = torch.zeros(n_cons, device=device)
     Ax.scatter_add_(0, cons_row, Ax_per_edge)
 
-    # sum_i |A_ji| * sqrt(u_i)  for margin
-    abs_cons_val = cons_val.abs()
-    abs_A_sqrt_u_per_edge = abs_cons_val * sqrt_u_raw[cons_col]
+    abs_A_relax_per_edge = cons_val.abs() * binary_relax[cons_col]
     margin_sum = torch.zeros(n_cons, device=device)
-    margin_sum.scatter_add_(0, cons_row, abs_A_sqrt_u_per_edge)
+    margin_sum.scatter_add_(0, cons_row, abs_A_relax_per_edge)
 
-    # Raw violation without tau: ReLU(Ax - b + K*margin_sum)
-    raw_no_tau = Ax - rhs + K * margin_sum
+    raw_no_tau = Ax - rhs + 2.0 * margin_sum
     xi_no_tau = torch.relu(raw_no_tau)
-
-    # Raw violation without margin and tau: ReLU(Ax - b)
     xi_raw = torch.relu(Ax - rhs)
 
-    # Per-constraint tolerance: tau_j(gamma) = K(gamma) * sqrt(u(x_0)) * sum_i |A_ji|
-    sqrt_u_0 = math.exp(-gamma / 2.0 * (tau_x0 - 0.5) ** 2)
-    sum_abs_A = torch.zeros(n_cons, device=device)
-    sum_abs_A.scatter_add_(0, cons_row, abs_cons_val)
-    tau_vec = K * sqrt_u_0 * sum_abs_A
-
-    # Clamp tau_vec to tau_min floor
-    if tau_min is not None:
-        tau_vec = torch.clamp(tau_vec, min=tau_min)
-
-    # Violation with tolerance: ReLU(Ax - b + K*margin_sum - tau_j)
+    tau_vec = torch.full_like(rhs, fill_value=float(tau))
     raw_violation = raw_no_tau - tau_vec
 
-    # Optional: normalize by constraint scale for balanced penalties
-    if cons_norm_cache is not None:
+    # Legacy opt-in normalization. Skip it for baseline-style normalize mode to avoid double normalization.
+    if cons_norm_cache is not None and loss_config != 'normalize':
         raw_violation = raw_violation / cons_norm_cache.to(device)
 
     xi = torch.relu(raw_violation)
 
-    # --- 5. Augmented Lagrangian loss ---
-    lagrangian_term = lambda_global * xi.sum()
-    penalty_term = (rho / 2.0) * (xi ** 2).sum()
-    loss = f_tilde_normalized + lagrangian_term + penalty_term
+    # --- 4. Scalar penalty term ---
+    mu_val = float(mu)
+    positive_mask = xi > 0
+    num_positive = positive_mask.sum()
 
-    # --- 6. Binary entropy regularization ---
-    # Encourages x_hat toward 0 or 1: H(x) = -[x*log(x) + (1-x)*log(1-x)]
-    # We MINIMIZE negative entropy (= maximize entropy early, then gamma takes over)
-    # Actually we want to push toward 0/1, so we ADD entropy as penalty
+    if loss_config == 'normalize':
+        c_norm = c.norm().clamp(min=1e-8)
+        obj_term = f_tilde / c_norm
+        if num_positive.item() > 0:
+            row_l2 = compute_constraint_l2_row_norms(cons_idx, cons_val, n_cons, device)
+            viol_term = (xi[positive_mask] / row_l2[positive_mask]).sum() / num_positive
+        else:
+            viol_term = torch.zeros((), device=device, dtype=f_tilde.dtype)
+        loss = obj_term + mu_val * viol_term
+    elif loss_config == 'sum':
+        loss = f_tilde + mu_val * xi.sum()
+    elif loss_config == 'nonzero_mean':
+        if num_positive.item() > 0:
+            loss = f_tilde + mu_val * xi[positive_mask].sum() / num_positive
+        else:
+            loss = f_tilde
+    elif loss_config == 'mean':
+        loss = f_tilde + mu_val * xi.mean()
+    else:
+        raise ValueError(f"Unknown loss_config: {loss_config}")
+
+    # --- 5. Optional binary entropy regularization ---
     entropy_val = torch.tensor(0.0, device=device)
     if entropy_weight > 0:
         x_clamped = x_hat.clamp(1e-6, 1 - 1e-6)
         binary_entropy = -(x_clamped * x_clamped.log() + (1 - x_clamped) * (1 - x_clamped).log())
-        # binary_entropy is maximal at x=0.5, zero at x=0 or x=1
-        # We want to push toward 0/1, so minimize this (it's already positive)
         entropy_val = binary_entropy.mean()
         loss = loss + entropy_weight * entropy_val
 
-    # --- 7. Statistics ---
     max_violation = xi.max().item() if xi.numel() > 0 else 0.0
     mean_violation = xi.mean().item() if xi.numel() > 0 else 0.0
 
@@ -208,6 +189,13 @@ def compute_constraint_norms(batch, device):
     # Add |b_j| to the norm for numerical stability
     norms = norms + rhs.abs()
     return norms.clamp(min=1e-4)
+
+
+def compute_constraint_l2_row_norms(cons_idx, cons_val, n_cons, device):
+    """Compute baseline-style L2 norm of each sparse constraint row."""
+    row_sq_sum = torch.zeros(n_cons, device=device)
+    row_sq_sum.scatter_add_(0, cons_idx[0], cons_val.pow(2))
+    return torch.sqrt(row_sq_sum).clamp(min=1e-8)
 
 
 @torch.no_grad()
@@ -338,16 +326,11 @@ class EMAModel:
 # ============================================================
 
 def train_epoch(model, data_loader, optimizer, scheduler, ema,
-                gamma, tau, lambda_global, rho, prev_violation,
-                inner_steps, beta, rho_max, gamma_max, delta_gamma,
+                gamma, tau, mu, loss_config,
                 entropy_weight, cons_normalize, grad_clip_norm,
-                device, step_counter,
-                freeze_lambda=False, freeze_gamma=False, freeze_rho=False,
-                tau_min=None):
+                device, tau_min=None):
     """
-    One epoch of ALM training with inner/outer loop.
-
-    Returns updated ALM state: (gamma, lambda_global, rho, prev_violation, step_counter, metrics)
+    One epoch of fixed-tau scalar-penalty training.
     """
     model.train()
 
@@ -402,9 +385,10 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         )
         x_hat = logits.sigmoid()
 
-        # --- Compute ALM loss ---
+        # --- Compute scalar-penalty loss ---
         loss, f_tilde, f_base, xi, xi_no_tau, xi_raw, max_viol, mean_viol, ent_val, tau_vec = compute_alm_loss(
-            x_hat, batch, gamma, tau, lambda_global, rho,
+            x_hat, batch, gamma, tau, mu,
+            loss_config=loss_config,
             cons_norm_cache=cons_norm,
             entropy_weight=entropy_weight,
             tau_min=tau_min,
@@ -456,23 +440,6 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
             total_infeasible_inst += n_infeas
 
         n_batches += 1
-        step_counter += 1
-
-        # --- Outer loop update ---
-        if step_counter % inner_steps == 0:
-            with torch.no_grad():
-                curr_viol = xi.sum().item() / max(batch.num_graphs, 1)
-                # Update global lambda
-                if not freeze_lambda:
-                    lambda_global = max(0.0, lambda_global + rho * curr_viol)
-                # Update rho if violations aren't decreasing fast enough
-                if not freeze_rho:
-                    if curr_viol > 0.8 * prev_violation and curr_viol > 1e-4:
-                        rho = min(rho * beta, rho_max)
-                # Gamma annealing
-                if not freeze_gamma:
-                    gamma = min(gamma + delta_gamma, gamma_max)
-                prev_violation = curr_viol
 
     n_batches = max(n_batches, 1)
     total_num_graphs = max(total_num_graphs, 1)
@@ -488,8 +455,7 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         'xi_mean_per_cons': total_xi_mean_per_cons / n_batches,
         'tau_mean': total_tau_mean / n_batches,
         'gamma': gamma,
-        'rho': rho,
-        'lambda_global': lambda_global,
+        'mu': mu,
         'K_gamma': compute_K(gamma),
         # Per-instance continuous metrics
         'obj_margin_per_inst': total_f_tilde / total_num_graphs,
@@ -504,14 +470,14 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         'n_infeasible_inst': total_infeasible_inst,
     }
 
-    return gamma, lambda_global, rho, prev_violation, step_counter, metrics
+    return metrics
 
 
 @torch.no_grad()
-def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
+def validate_epoch(model, data_loader, gamma, tau, mu, loss_config,
                    entropy_weight, cons_normalize, device, tau_min=None):
     """
-    Validate: compute ALM loss + discrete rounding metrics.
+    Validate: compute fixed-tau scalar-penalty loss + discrete rounding metrics.
     """
     model.eval()
 
@@ -566,7 +532,8 @@ def validate_epoch(model, data_loader, gamma, tau, lambda_global, rho,
         x_hat = logits.sigmoid()
 
         loss, f_tilde, f_base, xi, xi_no_tau, xi_raw, max_viol, mean_viol, _, tau_vec = compute_alm_loss(
-            x_hat, batch, gamma, tau, lambda_global, rho,
+            x_hat, batch, gamma, tau, mu,
+            loss_config=loss_config,
             cons_norm_cache=cons_norm,
             entropy_weight=entropy_weight,
             tau_min=tau_min,
@@ -656,9 +623,8 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed):
         f"Pred1={train_metrics['pred1_ratio']:.4f}  "
         f"Xi_mean/cons={train_metrics['xi_mean_per_cons']:.6f}  "
         f"Tau_mean={train_metrics['tau_mean']:.6f}",
-        f"  [ALM]   gamma={train_metrics['gamma']:.2f}  "
-        f"rho={train_metrics['rho']:.4f}  "
-        f"lambda={train_metrics['lambda_global']:.4f}  "
+        f"  [Penalty] mu={train_metrics['mu']:.4f}  "
+        f"gamma={train_metrics['gamma']:.2f}  "
         f"K(gamma)={train_metrics['K_gamma']:.6f}",
         # Train discrete per-instance
         f"  [TDisc] AvgObj/inst={train_metrics['disc_obj_per_inst']:.4f}  "
@@ -729,10 +695,9 @@ def log_to_tensorboard(writer, train_metrics, val_metrics, epoch):
     writer.add_scalar('Violation/Train_Max', train_metrics['max_violation'], epoch)
     writer.add_scalar('Violation/Train_Mean', train_metrics['mean_violation'], epoch)
 
-    # ALM environment
+    # Penalty environment
+    writer.add_scalar('Params/mu', train_metrics['mu'], epoch)
     writer.add_scalar('ALM/Gamma', train_metrics['gamma'], epoch)
-    writer.add_scalar('ALM/Rho', train_metrics['rho'], epoch)
-    writer.add_scalar('ALM/Lambda_Global', train_metrics['lambda_global'], epoch)
     writer.add_scalar('ALM/K_gamma', train_metrics['K_gamma'], epoch)
 
     # New metrics
@@ -788,7 +753,7 @@ def log_to_tensorboard(writer, train_metrics, val_metrics, epoch):
 # ============================================================
 
 def get_parser():
-    parser = argparse.ArgumentParser(description="Unsupervised ALM Training for ILP via GNN.")
+    parser = argparse.ArgumentParser(description="Unsupervised fixed-tau scalar-penalty training for ILP via GNN.")
 
     # Problem
     parser.add_argument("--problem_type", choices=TASKS, default='SC')
@@ -811,13 +776,26 @@ def get_parser():
     parser.add_argument("--batch_size", type=int, default=None,
                         help="Override task-specific batch size")
 
-    # ALM hyperparameters
+    # Fixed-tau scalar penalty hyperparameters
     parser.add_argument("--tau", type=float, default=0.9,
-                        help="Reference point x_0 for per-constraint tolerance "
-                             "tau_j(gamma) = K(gamma)*sqrt(u(x_0))*sum|A_ji| (default: %(default)s)")
-    parser.add_argument("--tau_min", type=float, default=0.99,
-                        help="Minimum value for tau_j(gamma); values below this are clamped "
-                             "(default: %(default)s). Set to 0 to disable.")
+                        help="Fixed uniform tolerance tau_j=tau applied to every constraint "
+                             "(default: %(default)s)")
+    parser.add_argument("--tau_min", type=float, default=0.0,
+                        help="Deprecated/ignored by the fixed-tau loss; kept for CLI compatibility "
+                             "(default: %(default)s).")
+    parser.add_argument("--loss_config", choices=['normalize', 'mean', 'sum', 'nonzero_mean'], default='sum',
+                        help="Loss reduction mode. Use 'normalize' for dilbaseline-style normalized objective/violations "
+                             "(default: %(default)s)")
+    parser.add_argument("--mu_init", type=float, default=0.3,
+                        help="Initial scalar constraint penalty mu (default: %(default)s)")
+    parser.add_argument("--mu_step_size", type=float, default=0.01,
+                        help="Step size for epoch-level mu update (default: %(default)s)")
+    parser.add_argument("--mu_value", type=float, default=1.0,
+                        help="Target average constraint violation for mu update (default: %(default)s)")
+    parser.add_argument("--mu_max", type=float, default=0.8,
+                        help="Maximum scalar constraint penalty mu (default: %(default)s)")
+    parser.add_argument("--mu_min", type=float, default=0.01,
+                        help="Minimum scalar constraint penalty mu (default: %(default)s)")
     parser.add_argument("--gamma_init", type=float, default=1.0,
                         help="Initial state sharpness (default: %(default)s)")
     parser.add_argument("--gamma_max", type=float, default=50.0,
@@ -825,21 +803,22 @@ def get_parser():
     parser.add_argument("--delta_gamma", type=float, default=0.3,
                         help="Gamma increment per outer step (default: %(default)s)")
     parser.add_argument("--rho_init", type=float, default=1.0,
-                        help="Initial penalty parameter (default: %(default)s)")
+                        help="Deprecated/ignored by scalar-mu training; kept for CLI compatibility")
     parser.add_argument("--rho_max", type=float, default=1e5,
-                        help="Maximum rho (default: %(default)s)")
+                        help="Deprecated/ignored by scalar-mu training; kept for CLI compatibility")
     parser.add_argument("--beta", type=float, default=1.5,
-                        help="Rho amplification factor (default: %(default)s)")
+                        help="Deprecated/ignored by scalar-mu training; kept for CLI compatibility")
     parser.add_argument("--inner_steps", type=int, default=20,
-                        help="Inner loop steps between ALM updates (default: %(default)s)")
+                        help="Deprecated/ignored by scalar-mu training; kept for CLI compatibility")
 
     # Regularization & training tricks
     parser.add_argument("--grad_clip_norm", type=float, default=1.0,
                         help="Max gradient norm for clipping (0 = no clipping)")
-    parser.add_argument("--entropy_weight", type=float, default=0.01,
-                        help="Binary entropy regularization weight (default: %(default)s)")
-    parser.add_argument("--cons_normalize", action='store_true', default=True,
-                        help="Normalize constraint violations by row norm")
+    parser.add_argument("--entropy_weight", type=float, default=0.0,
+                        help="Optional binary entropy regularization weight; 0 keeps the requested loss exact "
+                             "(default: %(default)s)")
+    parser.add_argument("--cons_normalize", action='store_true', default=False,
+                        help="Explicitly normalize constraint violations by row norm; off by default to match the requested formula")
     parser.add_argument("--no_cons_normalize", action='store_false', dest='cons_normalize')
     parser.add_argument("--ema_decay", type=float, default=0.999,
                         help="EMA decay (0 = no EMA)")
@@ -878,17 +857,15 @@ def get_parser():
     parser.add_argument("--patience", type=int, default=50,
                         help="Early-stop patience: epochs without improvement (default: %(default)s)")
 
-    # ALM freezing: freeze lambda (and optionally gamma/rho) when xi_sum < threshold2
+    # Deprecated ALM freezing arguments kept for CLI compatibility
     parser.add_argument("--es_xi_threshold2", type=float, default=None,
-                        help="When xi_sum/sample < this, freeze lambda. "
-                             "None = disabled (default: %(default)s)")
+                        help="Deprecated/ignored by scalar-mu training; kept for CLI compatibility")
     parser.add_argument("--threshold2_on", choices=['train', 'valid'], default='valid',
-                        help="Whether es_xi_threshold2 acts on train or valid metrics "
-                             "(default: %(default)s)")
+                        help="Deprecated/ignored by scalar-mu training; kept for CLI compatibility")
     parser.add_argument("--freeze_gamma_on_feasible", action='store_true', default=False,
-                        help="Also freeze gamma when xi_sum < es_xi_threshold2")
+                        help="Deprecated/ignored by scalar-mu training; kept for CLI compatibility")
     parser.add_argument("--freeze_rho_on_feasible", action='store_true', default=False,
-                        help="Also freeze rho when xi_sum < es_xi_threshold2")
+                        help="Deprecated/ignored by scalar-mu training; kept for CLI compatibility")
 
     parser.add_argument("--seed", type=int, default=0,
                         help="Random seed for reproducibility (default: %(default)s)")
@@ -914,10 +891,11 @@ def main():
     torch.cuda.manual_seed(args.seed)
 
     save_name = (
-        f'ALM_tau{args.tau}_taumin{args.tau_min}_gamma{args.gamma_init}_rho{args.rho_init}'
-        f'_inner{args.inner_steps}_ent{args.entropy_weight}'
+        f'ScalarMu_{args.loss_config}_tau{args.tau}_taumin{args.tau_min}_gamma{args.gamma_init}'
+        f'_mu{args.mu_init}_mustep{args.mu_step_size}_mutarget{args.mu_value}'
+        f'_murange{args.mu_min}-{args.mu_max}_ent{args.entropy_weight}'
         f'_ICC{args.Intra_Constraint_Competitive}'
-        f'_esxi{args.es_xi_threshold}_esxi2{args.es_xi_threshold2}_t2on{args.threshold2_on}'
+        f'_esxi{args.es_xi_threshold}'
     )
 
     # Create directories
@@ -1014,12 +992,9 @@ def main():
     # ---- EMA ----
     ema = EMAModel(model, decay=args.ema_decay) if args.ema_decay > 0 else None
 
-    # ---- ALM State ----
+    # ---- Scalar penalty state ----
     gamma = args.gamma_init
-    rho = args.rho_init
-    lambda_global = 0.0
-    prev_violation = float('inf')
-    step_counter = 0
+    mu = args.mu_init
     start_epoch = 0
 
     # ---- Resume from checkpoint ----
@@ -1037,13 +1012,12 @@ def main():
             if ema is not None and 'ema_shadow' in ckpt:
                 ema.shadow = ckpt['ema_shadow']
             gamma = ckpt.get('gamma', gamma)
-            rho = ckpt.get('rho', rho)
-            lambda_global = ckpt.get('lambda_global', lambda_global)
-            prev_violation = ckpt.get('prev_violation', prev_violation)
-            step_counter = ckpt.get('step_counter', step_counter)
+            mu = ckpt.get('mu', ckpt.get('lambda_global', mu))
+            ckpt_loss_config = ckpt.get('loss_config')
+            if ckpt_loss_config is not None and ckpt_loss_config != args.loss_config:
+                print(f"  Warning: checkpoint loss_config={ckpt_loss_config}, current loss_config={args.loss_config}")
             start_epoch = ckpt.get('epoch', 0) + 1
-            print(f"  Resumed full checkpoint: epoch={start_epoch}, gamma={gamma:.2f}, "
-                  f"rho={rho:.4f}, lambda={lambda_global:.4f}")
+            print(f"  Resumed full checkpoint: epoch={start_epoch}, gamma={gamma:.2f}, mu={mu:.4f}")
         else:
             # Plain state_dict (model weights only)
             model.load_state_dict(ckpt)
@@ -1054,16 +1028,19 @@ def main():
     best_val_obj = float('inf')
     best_feasible = False  # whether best model satisfies xi threshold
     patience_counter = 0
-    alm_frozen = False  # whether ALM params are frozen due to es_xi_threshold2
     best_allfeas_obj = float('inf')  # best discrete obj when ALL val instances are feasible
 
-    # Resolve tau_min: 0 means disabled
+    # Resolve tau_min for backward-compatible call signatures; fixed-tau loss ignores it.
     tau_min = args.tau_min if args.tau_min > 0 else None
 
     print(f"\n{'='*70}")
-    print(f"Starting Unsupervised ALM Training for {problem_type}")
-    print(f"  tau={args.tau}, tau_min={tau_min}, gamma_init={args.gamma_init}, rho_init={args.rho_init}")
-    print(f"  inner_steps={args.inner_steps}, beta={args.beta}")
+    print(f"Starting Unsupervised Fixed-Tau Scalar-Penalty Training for {problem_type}")
+    print(f"  tau={args.tau} (uniform fixed), tau_min={tau_min} ignored, gamma_init={args.gamma_init}")
+    print(f"  loss_config={args.loss_config}")
+    if args.loss_config == 'normalize' and args.cons_normalize:
+        print("  Note: --cons_normalize is ignored when loss_config=normalize to avoid double normalization.")
+    print(f"  mu_init={args.mu_init}, mu_step_size={args.mu_step_size}, mu_value={args.mu_value}")
+    print(f"  mu_range=[{args.mu_min}, {args.mu_max}]")
     print(f"  entropy_weight={args.entropy_weight}, grad_clip={args.grad_clip_norm}")
     print(f"  LR={args.lr}, schedule={args.lr_schedule}, warmup={args.warmup_epochs}")
     print(f"{'='*70}\n")
@@ -1072,18 +1049,18 @@ def main():
         t0 = time.time()
 
         # Train
-        freeze_lambda = alm_frozen
-        freeze_gamma = alm_frozen and args.freeze_gamma_on_feasible
-        freeze_rho = alm_frozen and args.freeze_rho_on_feasible
-        gamma, lambda_global, rho, prev_violation, step_counter, train_metrics = train_epoch(
+        train_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, ema,
-            gamma, args.tau, lambda_global, rho, prev_violation,
-            args.inner_steps, args.beta, args.rho_max, args.gamma_max, args.delta_gamma,
+            gamma, args.tau, mu, args.loss_config,
             args.entropy_weight, args.cons_normalize, args.grad_clip_norm,
-            device, step_counter,
-            freeze_lambda=freeze_lambda, freeze_gamma=freeze_gamma, freeze_rho=freeze_rho,
+            device,
             tau_min=tau_min,
         )
+
+        avg_cons = train_metrics['xi_margin_tau_per_inst']
+        mu = mu + args.mu_step_size * (avg_cons - args.mu_value)
+        mu = max(min(mu, args.mu_max), args.mu_min)
+        train_metrics['mu'] = mu
 
         # Validate periodically
         val_metrics = None
@@ -1094,7 +1071,7 @@ def main():
 
             val_metrics = validate_epoch(
                 model, valid_loader,
-                gamma, args.tau, lambda_global, rho,
+                gamma, args.tau, mu, args.loss_config,
                 args.entropy_weight, args.cons_normalize, device,
                 tau_min=tau_min,
             )
@@ -1144,49 +1121,14 @@ def main():
                     print(f"  [AllFeas] Saved best all-feasible model: "
                           f"disc_obj/inst={curr_obj:.4f}, n_infeasible=0")
 
-        # Check ALM freeze/unfreeze condition (can act on train or valid metrics)
-        if args.es_xi_threshold2 is not None:
-            if args.threshold2_on == 'train':
-                freeze_xi = train_metrics['xi_sum_per_sample']
-                freeze_src = 'train'
-            else:
-                # Only check when validation was performed this epoch
-                if val_metrics is not None:
-                    freeze_xi = val_metrics['xi_sum_per_sample']
-                    freeze_src = 'valid'
-                else:
-                    freeze_xi = None
-                    freeze_src = None
-
-            if freeze_xi is not None:
-                if freeze_xi < args.es_xi_threshold2:
-                    if not alm_frozen:
-                        alm_frozen = True
-                        frozen_parts = ["lambda"]
-                        if args.freeze_gamma_on_feasible:
-                            frozen_parts.append("gamma")
-                        if args.freeze_rho_on_feasible:
-                            frozen_parts.append("rho")
-                        print(f"  [Freeze] {freeze_src} xi_sum/sample={freeze_xi:.6f} < threshold2={args.es_xi_threshold2} "
-                              f"=> freezing {', '.join(frozen_parts)} "
-                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
-                else:
-                    if alm_frozen:
-                        alm_frozen = False
-                        print(f"  [Unfreeze] {freeze_src} xi_sum/sample={freeze_xi:.6f} >= threshold2={args.es_xi_threshold2} "
-                              f"=> resuming all ALM updates "
-                              f"(lambda={lambda_global:.4f}, gamma={gamma:.2f}, rho={rho:.4f})")
-
         # Save latest (full checkpoint for resumable training)
         full_ckpt = {
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'epoch': epoch,
             'gamma': gamma,
-            'rho': rho,
-            'lambda_global': lambda_global,
-            'prev_violation': prev_violation,
-            'step_counter': step_counter,
+            'mu': mu,
+            'loss_config': args.loss_config,
         }
         if scheduler is not None:
             full_ckpt['scheduler_state_dict'] = scheduler.state_dict()
