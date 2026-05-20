@@ -67,17 +67,18 @@ def compute_alm_loss(
     x_hat,           # [total_vars] GNN sigmoid output
     batch,           # PyG batch object
     gamma,           # retained for scheduler/log compatibility
-    tau,             # fixed uniform tolerance tau_j = tau
+    tau,             # fixed uniform constraint tolerance tau_j = tau
     mu,              # scalar constraint penalty parameter
     loss_config='sum',      # reduction/normalization mode for objective + violations
     cons_norm_cache=None,  # optional per-constraint normalization factors
     entropy_weight=0.0,    # optional binary entropy regularization weight
     tau_min=None,    # deprecated/ignored for fixed-tau loss
+    tau_obj=0.0,     # objective margin tolerance
 ):
     """
     Compute the fixed-tau scalar-penalty loss:
 
-        c^T x + 2 * sum_i |c_i| x_i(1-x_i)
+        c^T x + ReLU(2 * sum_i |c_i| x_i(1-x_i) - tau_obj)
         + mu * configured_reduction_j ReLU(A_j x - b_j + 2 * sum_i |A_ji| x_i(1-x_i) - tau)
 
     loss_config controls how the objective and constraint violations are reduced.
@@ -98,10 +99,11 @@ def compute_alm_loss(
     x_raw = x_raw / count_raw
     binary_relax = x_raw * (1.0 - x_raw)
 
-    # --- 2. Objective: c^T x + 2 * sum_i |c_i| x_i(1-x_i) ---
+    # --- 2. Objective: c^T x + ReLU(2 * sum_i |c_i| x_i(1-x_i) - tau_obj) ---
     c = batch.obj_coeffs.to(device)
     f_base = (c * x_raw).sum()
-    f_margin = 2.0 * (c.abs() * binary_relax).sum()
+    f_margin_raw = 2.0 * (c.abs() * binary_relax).sum()
+    f_margin = torch.relu(f_margin_raw - float(tau_obj))
     f_tilde = f_base + f_margin
 
     # --- 3. Constraint violations with fixed uniform tau ---
@@ -326,7 +328,7 @@ class EMAModel:
 # ============================================================
 
 def train_epoch(model, data_loader, optimizer, scheduler, ema,
-                gamma, tau, mu, loss_config,
+                gamma, tau, tau_obj, mu, loss_config,
                 entropy_weight, cons_normalize, grad_clip_norm,
                 device, tau_min=None):
     """
@@ -388,6 +390,7 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
         # --- Compute scalar-penalty loss ---
         loss, f_tilde, f_base, xi, xi_no_tau, xi_raw, max_viol, mean_viol, ent_val, tau_vec = compute_alm_loss(
             x_hat, batch, gamma, tau, mu,
+            tau_obj=tau_obj,
             loss_config=loss_config,
             cons_norm_cache=cons_norm,
             entropy_weight=entropy_weight,
@@ -474,7 +477,7 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
 
 
 @torch.no_grad()
-def validate_epoch(model, data_loader, gamma, tau, mu, loss_config,
+def validate_epoch(model, data_loader, gamma, tau, tau_obj, mu, loss_config,
                    entropy_weight, cons_normalize, device, tau_min=None):
     """
     Validate: compute fixed-tau scalar-penalty loss + discrete rounding metrics.
@@ -533,6 +536,7 @@ def validate_epoch(model, data_loader, gamma, tau, mu, loss_config,
 
         loss, f_tilde, f_base, xi, xi_no_tau, xi_raw, max_viol, mean_viol, _, tau_vec = compute_alm_loss(
             x_hat, batch, gamma, tau, mu,
+            tau_obj=tau_obj,
             loss_config=loss_config,
             cons_norm_cache=cons_norm,
             entropy_weight=entropy_weight,
@@ -780,6 +784,9 @@ def get_parser():
     parser.add_argument("--tau", type=float, default=0.9,
                         help="Fixed uniform tolerance tau_j=tau applied to every constraint "
                              "(default: %(default)s)")
+    parser.add_argument("--tau_obj", type=float, default=0.0,
+                        help="Objective margin tolerance in ReLU(2*sum_i |c_i|x_i(1-x_i) - tau_obj) "
+                             "(default: %(default)s)")
     parser.add_argument("--tau_min", type=float, default=0.0,
                         help="Deprecated/ignored by the fixed-tau loss; kept for CLI compatibility "
                              "(default: %(default)s).")
@@ -891,7 +898,7 @@ def main():
     torch.cuda.manual_seed(args.seed)
 
     save_name = (
-        f'ScalarMu_{args.loss_config}_tau{args.tau}_taumin{args.tau_min}_gamma{args.gamma_init}'
+        f'ScalarMu_{args.loss_config}_tau{args.tau}_tauobj{args.tau_obj}_taumin{args.tau_min}_gamma{args.gamma_init}'
         f'_mu{args.mu_init}_mustep{args.mu_step_size}_mutarget{args.mu_value}'
         f'_murange{args.mu_min}-{args.mu_max}_ent{args.entropy_weight}'
         f'_ICC{args.Intra_Constraint_Competitive}'
@@ -1035,7 +1042,7 @@ def main():
 
     print(f"\n{'='*70}")
     print(f"Starting Unsupervised Fixed-Tau Scalar-Penalty Training for {problem_type}")
-    print(f"  tau={args.tau} (uniform fixed), tau_min={tau_min} ignored, gamma_init={args.gamma_init}")
+    print(f"  tau={args.tau} (uniform fixed constraint), tau_obj={args.tau_obj}, tau_min={tau_min} ignored, gamma_init={args.gamma_init}")
     print(f"  loss_config={args.loss_config}")
     if args.loss_config == 'normalize' and args.cons_normalize:
         print("  Note: --cons_normalize is ignored when loss_config=normalize to avoid double normalization.")
@@ -1051,7 +1058,7 @@ def main():
         # Train
         train_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, ema,
-            gamma, args.tau, mu, args.loss_config,
+            gamma, args.tau, args.tau_obj, mu, args.loss_config,
             args.entropy_weight, args.cons_normalize, args.grad_clip_norm,
             device,
             tau_min=tau_min,
@@ -1071,7 +1078,7 @@ def main():
 
             val_metrics = validate_epoch(
                 model, valid_loader,
-                gamma, args.tau, mu, args.loss_config,
+                gamma, args.tau, args.tau_obj, mu, args.loss_config,
                 args.entropy_weight, args.cons_normalize, device,
                 tau_min=tau_min,
             )
@@ -1128,6 +1135,8 @@ def main():
             'epoch': epoch,
             'gamma': gamma,
             'mu': mu,
+            'tau': args.tau,
+            'tau_obj': args.tau_obj,
             'loss_config': args.loss_config,
         }
         if scheduler is not None:
