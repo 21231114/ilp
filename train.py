@@ -11,13 +11,13 @@ import os
 import math
 import time
 import random
-import copy
 
 import torch
 import torch.nn as nn
 import torch_geometric
+from torch_geometric.utils import unbatch
 
-from utils import TASKS
+from utils import TASKS, extract_raw_ilp
 from gnn import GNNPolicy
 from dataset.unsupervised_dataset import UnsupervisedGraphDataset
 
@@ -280,6 +280,67 @@ def evaluate_discrete(x_hat, batch, device):
             avg_violation_per_instance, n_feasible_instances, n_infeasible_instances)
 
 
+@torch.no_grad()
+def evaluate_discrete_single(x_hat, graph, device):
+    """Round one graph's probabilities and evaluate the original ILP."""
+    gnn_to_raw = graph.gnn_to_raw_map.to(device)
+    n_raw_vars = graph.obj_coeffs.shape[0]
+    x_raw = torch.zeros(n_raw_vars, device=device)
+    count_raw = torch.zeros(n_raw_vars, device=device)
+    x_raw.scatter_add_(0, gnn_to_raw, x_hat)
+    count_raw.scatter_add_(0, gnn_to_raw, torch.ones_like(x_hat))
+    x_raw = x_raw / count_raw.clamp(min=1)
+    x_rounded = torch.round(x_raw)
+
+    c = graph.obj_coeffs.to(device)
+    discrete_obj = (c * x_rounded).sum().item()
+
+    cons_idx = graph.raw_cons_indices.to(device)
+    cons_val = graph.raw_cons_values.to(device)
+    rhs = graph.raw_rhs.to(device)
+    n_cons = rhs.shape[0]
+
+    Ax_rounded = torch.zeros(n_cons, device=device)
+    Ax_rounded.scatter_add_(0, cons_idx[0], cons_val * x_rounded[cons_idx[1]])
+
+    violations = Ax_rounded - rhs
+    violation_pos = torch.relu(violations)
+    feasibility_rate = (violations <= 1e-6).float().mean().item() if n_cons > 0 else 1.0
+    violation_sum = violation_pos.sum().item()
+    is_feasible = violation_sum <= 1e-6
+
+    polarization_rate = ((x_hat < 0.05) | (x_hat > 0.95)).float().mean().item()
+    mean_uncertainty = (4 * x_hat * (1 - x_hat)).mean().item()
+
+    return feasibility_rate, discrete_obj, polarization_rate, mean_uncertainty, violation_sum, is_feasible
+
+
+def model_forward(model, batch, device):
+    """Run the GNN forward pass and return logits plus variable graph ids."""
+    constraint_features_batch = torch.repeat_interleave(
+        torch.arange(len(batch.ntcons), device=device),
+        batch.ntcons.clone().detach().long()
+    )
+    variable_features_batch = torch.repeat_interleave(
+        torch.arange(len(batch.ntvars), device=device),
+        batch.ntvars.clone().detach().long()
+    )
+
+    batch.constraint_features[torch.isinf(batch.constraint_features)] = 10
+
+    logits = model(
+        batch.constraint_features,
+        batch.edge_index,
+        batch.edge_attr,
+        batch.variable_features,
+        batch.n_constraints,
+        constraint_features_batch,
+        variable_features_batch,
+    )
+
+    return logits, variable_features_batch
+
+
 # ============================================================
 #  EMA Model
 # ============================================================
@@ -327,16 +388,15 @@ class EMAModel:
 #  Training Loop
 # ============================================================
 
-def train_epoch(model, data_loader, optimizer, scheduler, ema,
+def train_epoch(model, data_loader, optimizer, ema,
                 gamma, tau, tau_obj, mu, loss_config,
                 entropy_weight, cons_normalize, grad_clip_norm,
                 device, tau_min=None):
     """
-    One epoch of fixed-tau scalar-penalty training.
+    One epoch of fixed-tau scalar-penalty training, averaged per graph.
     """
     model.train()
 
-    # Accumulators for epoch-level metrics
     total_loss = 0.0
     total_f_tilde = 0.0
     total_f_base = 0.0
@@ -351,122 +411,90 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
     total_pred1_ratio = 0.0
     total_xi_mean_per_cons = 0.0
     total_tau_mean = 0.0
-    # Discrete metrics accumulators
     total_discrete_obj = 0.0
     total_discrete_viol = 0.0
     total_feasible_inst = 0
     total_infeasible_inst = 0
-    n_batches = 0
 
     for batch in data_loader:
         batch = batch.to(device)
 
-        # Precompute constraint norms if normalizing
-        cons_norm = compute_constraint_norms(batch, device) if cons_normalize else None
+        logits, variable_features_batch = model_forward(model, batch, device)
+        logits_per_graph = unbatch(logits, variable_features_batch)
+        graphs = batch.to_data_list()
 
-        # --- Forward pass ---
-        constraint_features_batch = torch.repeat_interleave(
-            torch.arange(len(batch.ntcons), device=device),
-            batch.ntcons.clone().detach().long()
-        )
-        variable_features_batch = torch.repeat_interleave(
-            torch.arange(len(batch.ntvars), device=device),
-            batch.ntvars.clone().detach().long()
-        )
+        batch_loss = torch.zeros((), device=device)
+        n_graphs = len(graphs)
 
-        batch.constraint_features[torch.isinf(batch.constraint_features)] = 10
+        for logits_i, graph in zip(logits_per_graph, graphs):
+            x_hat_i = logits_i.sigmoid()
+            cons_norm = compute_constraint_norms(graph, device) if cons_normalize else None
 
-        logits = model(
-            batch.constraint_features,
-            batch.edge_index,
-            batch.edge_attr,
-            batch.variable_features,
-            batch.n_constraints,
-            constraint_features_batch,
-            variable_features_batch,
-        )
-        x_hat = logits.sigmoid()
+            loss_i, f_tilde, f_base, xi, xi_no_tau, xi_raw, max_viol, mean_viol, ent_val, tau_vec = compute_alm_loss(
+                x_hat_i, graph, gamma, tau, mu,
+                tau_obj=tau_obj,
+                loss_config=loss_config,
+                cons_norm_cache=cons_norm,
+                entropy_weight=entropy_weight,
+                tau_min=tau_min,
+            )
+            batch_loss = batch_loss + loss_i
 
-        # --- Compute scalar-penalty loss ---
-        loss, f_tilde, f_base, xi, xi_no_tau, xi_raw, max_viol, mean_viol, ent_val, tau_vec = compute_alm_loss(
-            x_hat, batch, gamma, tau, mu,
-            tau_obj=tau_obj,
-            loss_config=loss_config,
-            cons_norm_cache=cons_norm,
-            entropy_weight=entropy_weight,
-            tau_min=tau_min,
-        )
+            total_loss += loss_i.item()
+            total_f_tilde += f_tilde
+            total_f_base += f_base
+            total_max_viol += max_viol
+            total_mean_viol += mean_viol
+            total_entropy += ent_val
+            total_xi_sum += xi_no_tau.sum().item()
+            total_xi_with_tau_sum += xi.sum().item()
+            total_xi_raw_sum += xi_raw.sum().item()
+            total_xi_mean_per_cons += xi_no_tau.sum().item() / max(xi_no_tau.numel(), 1)
+            total_tau_mean += tau_vec.mean().item()
 
-        # Normalize by number of graphs in batch
-        loss = loss / max(batch.num_graphs, 1)
+            with torch.no_grad():
+                x_rounded = torch.round(x_hat_i)
+                total_pred0_ratio += (x_rounded == 0).float().mean().item()
+                total_pred1_ratio += (x_rounded == 1).float().mean().item()
+                _, disc_obj, _, _, viol_sum, is_feasible = evaluate_discrete_single(x_hat_i, graph, device)
+                total_discrete_obj += disc_obj
+                total_discrete_viol += viol_sum
+                total_feasible_inst += int(is_feasible)
+                total_infeasible_inst += int(not is_feasible)
 
-        # --- Backward + optimize ---
+        loss = batch_loss / max(n_graphs, 1)
+
         optimizer.zero_grad()
         loss.backward()
         if grad_clip_norm > 0:
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
         optimizer.step()
 
-        if scheduler is not None:
-            scheduler.step()
-
         if ema is not None:
             ema.update(model)
 
-        # --- Accumulate metrics ---
-        total_loss += loss.item()
-        total_f_tilde += f_tilde
-        total_f_base += f_base
-        total_max_viol += max_viol
-        total_mean_viol += mean_viol
-        total_entropy += ent_val
-        total_xi_sum += xi_no_tau.sum().item()
-        total_xi_with_tau_sum += xi.sum().item()
-        total_xi_raw_sum += xi_raw.sum().item()
-        total_num_graphs += batch.num_graphs
+        total_num_graphs += n_graphs
 
-        # Predicted 0/1 ratio and discrete evaluation
-        with torch.no_grad():
-            x_rounded = torch.round(x_hat)
-            total_pred0_ratio += (x_rounded == 0).float().mean().item()
-            total_pred1_ratio += (x_rounded == 1).float().mean().item()
-            # Mean xi_j per constraint (average across constraints)
-            total_xi_mean_per_cons += (xi_no_tau.sum().item() / max(xi_no_tau.numel(), 1))
-            # Mean tau_j
-            total_tau_mean += tau_vec.mean().item()
-
-            # Discrete evaluation
-            feas, disc_obj, _, _, avg_viol_inst, n_feas, n_infeas = evaluate_discrete(x_hat, batch, device)
-            total_discrete_obj += disc_obj
-            total_discrete_viol += avg_viol_inst * batch.num_graphs
-            total_feasible_inst += n_feas
-            total_infeasible_inst += n_infeas
-
-        n_batches += 1
-
-    n_batches = max(n_batches, 1)
     total_num_graphs = max(total_num_graphs, 1)
     metrics = {
-        'loss_total': total_loss / n_batches,
-        'objective_margin': total_f_tilde / n_batches,
-        'max_violation': total_max_viol / n_batches,
-        'mean_violation': total_mean_viol / n_batches,
-        'entropy': total_entropy / n_batches,
+        'loss_total': total_loss / total_num_graphs,
+        'objective_margin': total_f_tilde / total_num_graphs,
+        'max_violation': total_max_viol / total_num_graphs,
+        'mean_violation': total_mean_viol / total_num_graphs,
+        'entropy': total_entropy / total_num_graphs,
         'xi_sum_per_sample': total_xi_sum / total_num_graphs,
-        'pred0_ratio': total_pred0_ratio / n_batches,
-        'pred1_ratio': total_pred1_ratio / n_batches,
-        'xi_mean_per_cons': total_xi_mean_per_cons / n_batches,
-        'tau_mean': total_tau_mean / n_batches,
+        'pred0_ratio': total_pred0_ratio / total_num_graphs,
+        'pred1_ratio': total_pred1_ratio / total_num_graphs,
+        'xi_mean_per_cons': total_xi_mean_per_cons / total_num_graphs,
+        'tau_mean': total_tau_mean / total_num_graphs,
         'gamma': gamma,
         'mu': mu,
         'K_gamma': compute_K(gamma),
-        # Per-instance continuous metrics
         'obj_margin_per_inst': total_f_tilde / total_num_graphs,
         'obj_raw_per_inst': total_f_base / total_num_graphs,
         'xi_margin_tau_per_inst': total_xi_with_tau_sum / total_num_graphs,
         'xi_raw_per_inst': total_xi_raw_sum / total_num_graphs,
         'xi_margin_per_inst': total_xi_sum / total_num_graphs,
-        # Per-instance discrete metrics
         'disc_obj_per_inst': total_discrete_obj / total_num_graphs,
         'disc_viol_per_inst': total_discrete_viol / total_num_graphs,
         'n_feasible_inst': total_feasible_inst,
@@ -480,7 +508,7 @@ def train_epoch(model, data_loader, optimizer, scheduler, ema,
 def validate_epoch(model, data_loader, gamma, tau, tau_obj, mu, loss_config,
                    entropy_weight, cons_normalize, device, tau_min=None):
     """
-    Validate: compute fixed-tau scalar-penalty loss + discrete rounding metrics.
+    Validate with the current ALM loss averaged per graph plus rounding metrics.
     """
     model.eval()
 
@@ -491,6 +519,7 @@ def validate_epoch(model, data_loader, gamma, tau, tau_obj, mu, loss_config,
     total_mean_viol = 0.0
     total_feasibility = 0.0
     total_discrete_obj = 0.0
+    total_round_obj_feasible = 0.0
     total_polarization = 0.0
     total_uncertainty = 0.0
     total_xi_sum = 0.0
@@ -501,110 +530,85 @@ def validate_epoch(model, data_loader, gamma, tau, tau_obj, mu, loss_config,
     total_pred1_ratio = 0.0
     total_xi_mean_per_cons = 0.0
     total_tau_mean = 0.0
-    # Per-instance discrete metrics
     total_discrete_viol = 0.0
     total_feasible_inst = 0
     total_infeasible_inst = 0
-    n_batches = 0
 
     for batch in data_loader:
         batch = batch.to(device)
 
-        cons_norm = compute_constraint_norms(batch, device) if cons_normalize else None
+        logits, variable_features_batch = model_forward(model, batch, device)
+        logits_per_graph = unbatch(logits, variable_features_batch)
+        graphs = batch.to_data_list()
 
-        constraint_features_batch = torch.repeat_interleave(
-            torch.arange(len(batch.ntcons), device=device),
-            batch.ntcons.clone().detach().long()
-        )
-        variable_features_batch = torch.repeat_interleave(
-            torch.arange(len(batch.ntvars), device=device),
-            batch.ntvars.clone().detach().long()
-        )
+        for logits_i, graph in zip(logits_per_graph, graphs):
+            x_hat_i = logits_i.sigmoid()
+            cons_norm = compute_constraint_norms(graph, device) if cons_normalize else None
 
-        batch.constraint_features[torch.isinf(batch.constraint_features)] = 10
+            loss, f_tilde, f_base, xi, xi_no_tau, xi_raw, max_viol, mean_viol, _, tau_vec = compute_alm_loss(
+                x_hat_i, graph, gamma, tau, mu,
+                tau_obj=tau_obj,
+                loss_config=loss_config,
+                cons_norm_cache=cons_norm,
+                entropy_weight=entropy_weight,
+                tau_min=tau_min,
+            )
 
-        logits = model(
-            batch.constraint_features,
-            batch.edge_index,
-            batch.edge_attr,
-            batch.variable_features,
-            batch.n_constraints,
-            constraint_features_batch,
-            variable_features_batch,
-        )
-        x_hat = logits.sigmoid()
+            feas, disc_obj, polar, uncert, viol_sum, is_feasible = evaluate_discrete_single(x_hat_i, graph, device)
 
-        loss, f_tilde, f_base, xi, xi_no_tau, xi_raw, max_viol, mean_viol, _, tau_vec = compute_alm_loss(
-            x_hat, batch, gamma, tau, mu,
-            tau_obj=tau_obj,
-            loss_config=loss_config,
-            cons_norm_cache=cons_norm,
-            entropy_weight=entropy_weight,
-            tau_min=tau_min,
-        )
-        loss = loss / max(batch.num_graphs, 1)
+            total_loss += loss.item()
+            total_f_tilde += f_tilde
+            total_f_base += f_base
+            total_max_viol += max_viol
+            total_mean_viol += mean_viol
+            total_feasibility += feas
+            total_discrete_obj += disc_obj
+            total_polarization += polar
+            total_uncertainty += uncert
+            total_xi_sum += xi_no_tau.sum().item()
+            total_xi_with_tau_sum += xi.sum().item()
+            total_xi_raw_sum += xi_raw.sum().item()
+            total_discrete_viol += viol_sum
+            total_feasible_inst += int(is_feasible)
+            total_infeasible_inst += int(not is_feasible)
+            if is_feasible:
+                total_round_obj_feasible += disc_obj
 
-        # Discrete evaluation
-        feas, disc_obj, polar, uncert, avg_viol_inst, n_feas, n_infeas = evaluate_discrete(x_hat, batch, device)
+            x_rounded = torch.round(x_hat_i)
+            total_pred0_ratio += (x_rounded == 0).float().mean().item()
+            total_pred1_ratio += (x_rounded == 1).float().mean().item()
+            total_xi_mean_per_cons += xi_no_tau.sum().item() / max(xi_no_tau.numel(), 1)
+            total_tau_mean += tau_vec.mean().item()
+            total_num_graphs += 1
 
-        total_loss += loss.item()
-        total_f_tilde += f_tilde
-        total_f_base += f_base
-        total_max_viol += max_viol
-        total_mean_viol += mean_viol
-        total_feasibility += feas
-        total_discrete_obj += disc_obj
-        total_polarization += polar
-        total_uncertainty += uncert
-        total_xi_sum += xi_no_tau.sum().item()
-        total_xi_with_tau_sum += xi.sum().item()
-        total_xi_raw_sum += xi_raw.sum().item()
-        total_num_graphs += batch.num_graphs
-
-        # Per-instance discrete
-        total_discrete_viol += avg_viol_inst * batch.num_graphs
-        total_feasible_inst += n_feas
-        total_infeasible_inst += n_infeas
-
-        # Predicted 0/1 ratio
-        x_rounded = torch.round(x_hat)
-        total_pred0_ratio += (x_rounded == 0).float().mean().item()
-        total_pred1_ratio += (x_rounded == 1).float().mean().item()
-        # Mean xi_j per constraint
-        total_xi_mean_per_cons += (xi_no_tau.sum().item() / max(xi_no_tau.numel(), 1))
-        # Mean tau_j
-        total_tau_mean += tau_vec.mean().item()
-
-        n_batches += 1
-
-    n_batches = max(n_batches, 1)
     total_num_graphs = max(total_num_graphs, 1)
     metrics = {
-        'loss_total': total_loss / n_batches,
-        'objective_margin': total_f_tilde / n_batches,
-        'max_violation': total_max_viol / n_batches,
-        'mean_violation': total_mean_viol / n_batches,
-        'feasibility_rate': total_feasibility / n_batches,
-        'discrete_objective': total_discrete_obj / n_batches,
-        'polarization_rate': total_polarization / n_batches,
-        'mean_uncertainty': total_uncertainty / n_batches,
+        'loss_total': total_loss / total_num_graphs,
+        'objective_margin': total_f_tilde / total_num_graphs,
+        'max_violation': total_max_viol / total_num_graphs,
+        'mean_violation': total_mean_viol / total_num_graphs,
+        'feasibility_rate': total_feasibility / total_num_graphs,
+        'discrete_objective': total_discrete_obj / total_num_graphs,
+        'polarization_rate': total_polarization / total_num_graphs,
+        'mean_uncertainty': total_uncertainty / total_num_graphs,
         'xi_sum_per_sample': total_xi_sum / total_num_graphs,
         'objective_per_sample': total_discrete_obj / total_num_graphs,
-        'pred0_ratio': total_pred0_ratio / n_batches,
-        'pred1_ratio': total_pred1_ratio / n_batches,
-        'xi_mean_per_cons': total_xi_mean_per_cons / n_batches,
-        'tau_mean': total_tau_mean / n_batches,
-        # Per-instance continuous metrics
+        'pred0_ratio': total_pred0_ratio / total_num_graphs,
+        'pred1_ratio': total_pred1_ratio / total_num_graphs,
+        'xi_mean_per_cons': total_xi_mean_per_cons / total_num_graphs,
+        'tau_mean': total_tau_mean / total_num_graphs,
         'obj_margin_per_inst': total_f_tilde / total_num_graphs,
         'obj_raw_per_inst': total_f_base / total_num_graphs,
         'xi_margin_tau_per_inst': total_xi_with_tau_sum / total_num_graphs,
         'xi_raw_per_inst': total_xi_raw_sum / total_num_graphs,
         'xi_margin_per_inst': total_xi_sum / total_num_graphs,
-        # Per-instance discrete metrics
         'disc_obj_per_inst': total_discrete_obj / total_num_graphs,
         'disc_viol_per_inst': total_discrete_viol / total_num_graphs,
         'n_feasible_inst': total_feasible_inst,
         'n_infeasible_inst': total_infeasible_inst,
+        'round_n_feasible': total_feasible_inst,
+        'round_avg_obj': total_round_obj_feasible / max(total_feasible_inst, 1),
+        'n_valid_instances': total_feasible_inst + total_infeasible_inst,
     }
     return metrics
 
@@ -629,7 +633,9 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed):
         f"Tau_mean={train_metrics['tau_mean']:.6f}",
         f"  [Penalty] mu={train_metrics['mu']:.4f}  "
         f"gamma={train_metrics['gamma']:.2f}  "
-        f"K(gamma)={train_metrics['K_gamma']:.6f}",
+        f"K(gamma)={train_metrics['K_gamma']:.6f}  "
+        f"lr_o={train_metrics['lr_o']:.2e}  "
+        f"lr_i={train_metrics['lr_i']:.2e}",
         # Train discrete per-instance
         f"  [TDisc] AvgObj/inst={train_metrics['disc_obj_per_inst']:.4f}  "
         f"AvgViol/inst={train_metrics['disc_viol_per_inst']:.6f}  "
@@ -662,6 +668,14 @@ def format_metrics(train_metrics, val_metrics, epoch, elapsed):
             f"Polarization={val_metrics['polarization_rate']:.4f}  "
             f"Uncertainty={val_metrics['mean_uncertainty']:.4f}"
         )
+        lines.append(
+            f"  [Round] Feasible={val_metrics['round_n_feasible']}/{val_metrics['n_valid_instances']}  "
+            f"AvgObj={val_metrics['round_avg_obj']:.4f}  "
+            f"BestFeas={val_metrics.get('best_round_feasible', -1)}  "
+            f"BestObj={val_metrics.get('best_round_obj', float('inf')):.4f}"
+        )
+        if val_metrics.get('best_saved'):
+            lines.append("  >> Best model saved by rounded feasibility")
         # Validation discrete per-instance
         lines.append(
             f"  [VDisc] AvgObj/inst={val_metrics['disc_obj_per_inst']:.4f}  "
@@ -701,6 +715,8 @@ def log_to_tensorboard(writer, train_metrics, val_metrics, epoch):
 
     # Penalty environment
     writer.add_scalar('Params/mu', train_metrics['mu'], epoch)
+    writer.add_scalar('Params/lr_o', train_metrics['lr_o'], epoch)
+    writer.add_scalar('Params/lr_i', train_metrics['lr_i'], epoch)
     writer.add_scalar('ALM/Gamma', train_metrics['gamma'], epoch)
     writer.add_scalar('ALM/K_gamma', train_metrics['K_gamma'], epoch)
 
@@ -731,6 +747,8 @@ def log_to_tensorboard(writer, train_metrics, val_metrics, epoch):
         # Discrete ground truth
         writer.add_scalar('Discrete/Feasibility_Rate', val_metrics['feasibility_rate'], epoch)
         writer.add_scalar('Discrete/Objective', val_metrics['discrete_objective'], epoch)
+        writer.add_scalar('Round/feasible_count', val_metrics['round_n_feasible'], epoch)
+        writer.add_scalar('Round/avg_obj', val_metrics['round_avg_obj'], epoch)
         writer.add_scalar('State/Polarization_Rate', val_metrics['polarization_rate'], epoch)
         writer.add_scalar('State/Mean_Uncertainty', val_metrics['mean_uncertainty'], epoch)
 
@@ -772,10 +790,15 @@ def get_parser():
     parser.add_argument('--Intra_Constraint_Competitive', default=False, action='store_true')
 
     # Training hyperparameters
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-5,
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Deprecated compatibility alias: if set, overrides both lr_output and lr_inner")
+    parser.add_argument("--lr_output", type=float, default=5e-4,
+                        help="Learning rate for output layers (default: %(default)s)")
+    parser.add_argument("--lr_inner", type=float, default=5e-4,
+                        help="Learning rate for GNN body (default: %(default)s)")
+    parser.add_argument("--weight_decay", type=float, default=0.0,
                         help="L2 regularization (default: %(default)s)")
-    parser.add_argument("--num_epochs", type=int, default=5000)
+    parser.add_argument("--num_epochs", type=int, default=12)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=None,
                         help="Override task-specific batch size")
@@ -790,8 +813,8 @@ def get_parser():
     parser.add_argument("--tau_min", type=float, default=0.0,
                         help="Deprecated/ignored by the fixed-tau loss; kept for CLI compatibility "
                              "(default: %(default)s).")
-    parser.add_argument("--loss_config", choices=['normalize', 'mean', 'sum', 'nonzero_mean'], default='sum',
-                        help="Loss reduction mode. Use 'normalize' for dilbaseline-style normalized objective/violations "
+    parser.add_argument("--loss_config", choices=['normalize', 'mean', 'sum', 'nonzero_mean'], default='normalize',
+                        help="Loss reduction mode; formulas remain the current fixed-tau ALM loss "
                              "(default: %(default)s)")
     parser.add_argument("--mu_init", type=float, default=0.3,
                         help="Initial scalar constraint penalty mu (default: %(default)s)")
@@ -799,16 +822,16 @@ def get_parser():
                         help="Step size for epoch-level mu update (default: %(default)s)")
     parser.add_argument("--mu_value", type=float, default=1.0,
                         help="Target average constraint violation for mu update (default: %(default)s)")
-    parser.add_argument("--mu_max", type=float, default=0.8,
+    parser.add_argument("--mu_max", type=float, default=5.0,
                         help="Maximum scalar constraint penalty mu (default: %(default)s)")
     parser.add_argument("--mu_min", type=float, default=0.01,
                         help="Minimum scalar constraint penalty mu (default: %(default)s)")
     parser.add_argument("--gamma_init", type=float, default=1.0,
-                        help="Initial state sharpness (default: %(default)s)")
+                        help="Initial state sharpness retained for compatibility (default: %(default)s)")
     parser.add_argument("--gamma_max", type=float, default=50.0,
-                        help="Maximum gamma (default: %(default)s)")
+                        help="Deprecated/ignored by scalar-mu training; kept for CLI compatibility")
     parser.add_argument("--delta_gamma", type=float, default=0.3,
-                        help="Gamma increment per outer step (default: %(default)s)")
+                        help="Deprecated/ignored by scalar-mu training; kept for CLI compatibility")
     parser.add_argument("--rho_init", type=float, default=1.0,
                         help="Deprecated/ignored by scalar-mu training; kept for CLI compatibility")
     parser.add_argument("--rho_max", type=float, default=1e5,
@@ -825,14 +848,20 @@ def get_parser():
                         help="Optional binary entropy regularization weight; 0 keeps the requested loss exact "
                              "(default: %(default)s)")
     parser.add_argument("--cons_normalize", action='store_true', default=False,
-                        help="Explicitly normalize constraint violations by row norm; off by default to match the requested formula")
+                        help="Explicitly normalize constraint violations by row norm; ignored when loss_config=normalize")
     parser.add_argument("--no_cons_normalize", action='store_false', dest='cons_normalize')
-    parser.add_argument("--ema_decay", type=float, default=0.999,
-                        help="EMA decay (0 = no EMA)")
-    parser.add_argument("--warmup_epochs", type=int, default=10,
-                        help="LR warmup epochs (default: %(default)s)")
-    parser.add_argument("--lr_schedule", choices=['cosine', 'step', 'none'], default='cosine',
+    parser.add_argument("--ema_decay", type=float, default=0.0,
+                        help="EMA decay; default 0 disables EMA to match dilbaseline")
+    parser.add_argument("--warmup_epochs", type=int, default=0,
+                        help="Deprecated/ignored by dilbaseline-style scheduler; kept for CLI compatibility")
+    parser.add_argument("--lr_schedule", choices=['cos', 'cosrestart', 'exp', 'none'], default='exp',
                         help="LR schedule type (default: %(default)s)")
+    parser.add_argument("--cos_T", type=int, default=200,
+                        help="T_max/T_0 for cosine schedulers (default: %(default)s)")
+    parser.add_argument("--cos_min", type=float, default=0.0,
+                        help="Minimum LR for cosine schedulers (default: %(default)s)")
+    parser.add_argument("--lr_anneal_factor", type=float, default=0.88,
+                        help="Multiplicative factor for ExponentialLR (default: %(default)s)")
 
     # Paths
     parser.add_argument("--instance_dir",
@@ -860,9 +889,9 @@ def get_parser():
 
     # Early stopping
     parser.add_argument("--es_xi_threshold", type=float, default=1.0,
-                        help="Early-stop feasibility threshold: avg sum_j xi_j per sample (default: %(default)s)")
-    parser.add_argument("--patience", type=int, default=50,
-                        help="Early-stop patience: epochs without improvement (default: %(default)s)")
+                        help="Deprecated for best-model selection; kept for CLI compatibility")
+    parser.add_argument("--patience", type=int, default=200,
+                        help="Early-stop patience: epochs without rounded-feasibility improvement (default: %(default)s)")
 
     # Deprecated ALM freezing arguments kept for CLI compatibility
     parser.add_argument("--es_xi_threshold2", type=float, default=None,
@@ -890,19 +919,21 @@ def main():
 
     device = args.device
     problem_type = args.problem_type
-    batch_size = args.batch_size or TASK_BATCH_SIZE.get(problem_type, 4)
+    if args.lr is not None:
+        args.lr_output = args.lr
+        args.lr_inner = args.lr
+    batch_size = args.batch_size or TASK_BATCH_SIZE.get(problem_type, 1)
 
     # Fix random seed for reproducibility
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
     save_name = (
-        f'ScalarMu_{args.loss_config}_tau{args.tau}_tauobj{args.tau_obj}_taumin{args.tau_min}_gamma{args.gamma_init}'
+        f'ScalarMu_{args.loss_config}_lr{args.lr_output}_{args.lr_inner}_tau{args.tau}_tauobj{args.tau_obj}'
         f'_mu{args.mu_init}_mustep{args.mu_step_size}_mutarget{args.mu_value}'
-        f'_murange{args.mu_min}-{args.mu_max}_ent{args.entropy_weight}'
-        f'_ICC{args.Intra_Constraint_Competitive}'
-        f'_esxi{args.es_xi_threshold}'
+        f'_murange{args.mu_min}-{args.mu_max}_sched{args.lr_schedule}'
+        f'_ent{args.entropy_weight}_ICC{args.Intra_Constraint_Competitive}'
     )
 
     # Create directories
@@ -958,6 +989,14 @@ def main():
     print(f"Train instances: {len(train_files)}, Valid instances: {len(valid_files)}")
     print(f"Batch size: {batch_size}")
 
+    first_data = train_data[0]
+    if hasattr(first_data, 'obj_sense_min'):
+        is_minimize = bool(first_data.obj_sense_min.item())
+    else:
+        is_minimize = extract_raw_ilp(train_files[0])['obj_sense_min']
+    opt_dir = "MINIMIZE" if is_minimize else "MAXIMIZE"
+    print(f"Objective sense: {opt_dir} (coefficients are sign-adjusted for the current loss)")
+
     # ---- Model ----
     model = GNNPolicy(
         emb_size=args.emb_size,
@@ -968,31 +1007,32 @@ def main():
         Intra_Constraint_Competitive=args.Intra_Constraint_Competitive,
     ).to(device)
 
-    # Initialize output layer bias to 0 (sigmoid(0) = 0.5, neutral start)
-    for m in model.vars_output_layer:
-        if isinstance(m, nn.Linear) and m.out_features == 1:
-            nn.init.zeros_(m.bias)
-            nn.init.xavier_uniform_(m.weight, gain=0.1)
+    # ---- Optimizer with separate learning rates ----
+    output_param_ids = set()
+    for layer in (model.vars_output_layer, model.cons_output_layer):
+        for p in layer.parameters():
+            output_param_ids.add(id(p))
+    other_params = [p for p in model.parameters() if id(p) not in output_param_ids]
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = torch.optim.Adam([
+        {'params': model.vars_output_layer.parameters(), 'lr': args.lr_output},
+        {'params': model.cons_output_layer.parameters(), 'lr': args.lr_output},
+        {'params': other_params, 'lr': args.lr_inner},
+    ], weight_decay=args.weight_decay)
 
     # ---- LR Schedule ----
-    total_steps = args.num_epochs * len(train_loader)
-    warmup_steps = args.warmup_epochs * len(train_loader)
-
-    if args.lr_schedule == 'cosine' and total_steps > 0:
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return max(step / max(warmup_steps, 1), 0.01)
-            progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-            return max(0.5 * (1 + math.cos(math.pi * progress)), 0.01)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    elif args.lr_schedule == 'step':
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=total_steps // 5, gamma=0.5)
+    if args.lr_schedule == 'cos':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.cos_T, eta_min=args.cos_min
+        )
+    elif args.lr_schedule == 'cosrestart':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=args.cos_T, T_mult=2, eta_min=args.cos_min
+        )
+    elif args.lr_schedule == 'exp':
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer, gamma=args.lr_anneal_factor
+        )
     else:
         scheduler = None
 
@@ -1013,9 +1053,16 @@ def main():
         if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
             # Full checkpoint with training state
             model.load_state_dict(ckpt['model_state_dict'])
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            if 'optimizer_state_dict' in ckpt:
+                try:
+                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                except Exception as exc:
+                    print(f"  Warning: optimizer state is incompatible with grouped Adam; using a fresh optimizer ({exc})")
             if scheduler is not None and 'scheduler_state_dict' in ckpt:
-                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                try:
+                    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                except Exception as exc:
+                    print(f"  Warning: scheduler state is incompatible; using a fresh scheduler ({exc})")
             if ema is not None and 'ema_shadow' in ckpt:
                 ema.shadow = ckpt['ema_shadow']
             gamma = ckpt.get('gamma', gamma)
@@ -1031,25 +1078,26 @@ def main():
             print("  Loaded model weights (no optimizer/ALM state). Training from epoch 0.")
 
     # ---- Training ----
-    best_val_xi_sum = float('inf')
-    best_val_obj = float('inf')
-    best_feasible = False  # whether best model satisfies xi threshold
+    best_round_feasible = -1
+    best_round_obj = float('inf')
     patience_counter = 0
-    best_allfeas_obj = float('inf')  # best discrete obj when ALL val instances are feasible
+    best_allfeas_obj = float('inf')
 
     # Resolve tau_min for backward-compatible call signatures; fixed-tau loss ignores it.
     tau_min = args.tau_min if args.tau_min > 0 else None
 
     print(f"\n{'='*70}")
-    print(f"Starting Unsupervised Fixed-Tau Scalar-Penalty Training for {problem_type}")
-    print(f"  tau={args.tau} (uniform fixed constraint), tau_obj={args.tau_obj}, tau_min={tau_min} ignored, gamma_init={args.gamma_init}")
+    print(f"Starting Fixed-Tau ALM Training with dilbaseline-style GD for {problem_type} ({opt_dir})")
+    print(f"  tau={args.tau} (uniform fixed constraint), tau_obj={args.tau_obj}, tau_min={tau_min} ignored")
     print(f"  loss_config={args.loss_config}")
     if args.loss_config == 'normalize' and args.cons_normalize:
         print("  Note: --cons_normalize is ignored when loss_config=normalize to avoid double normalization.")
     print(f"  mu_init={args.mu_init}, mu_step_size={args.mu_step_size}, mu_value={args.mu_value}")
     print(f"  mu_range=[{args.mu_min}, {args.mu_max}]")
-    print(f"  entropy_weight={args.entropy_weight}, grad_clip={args.grad_clip_norm}")
-    print(f"  LR={args.lr}, schedule={args.lr_schedule}, warmup={args.warmup_epochs}")
+    print(f"  entropy_weight={args.entropy_weight}, grad_clip={args.grad_clip_norm}, ema_decay={args.ema_decay}")
+    print(f"  lr_output={args.lr_output}, lr_inner={args.lr_inner}, weight_decay={args.weight_decay}")
+    print(f"  lr_schedule={args.lr_schedule}, cos_T={args.cos_T}, cos_min={args.cos_min}, lr_anneal_factor={args.lr_anneal_factor}")
+    print(f"  batch_size={batch_size}, num_epochs={args.num_epochs}")
     print(f"{'='*70}\n")
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -1057,12 +1105,20 @@ def main():
 
         # Train
         train_metrics = train_epoch(
-            model, train_loader, optimizer, scheduler, ema,
+            model, train_loader, optimizer, ema,
             gamma, args.tau, args.tau_obj, mu, args.loss_config,
             args.entropy_weight, args.cons_normalize, args.grad_clip_norm,
             device,
             tau_min=tau_min,
         )
+
+        if scheduler is not None:
+            scheduler.step()
+            lr_list = scheduler.get_last_lr()
+        else:
+            lr_list = [args.lr_output, args.lr_output, args.lr_inner]
+        train_metrics['lr_o'] = lr_list[0]
+        train_metrics['lr_i'] = lr_list[-1]
 
         avg_cons = train_metrics['xi_margin_tau_per_inst']
         mu = mu + args.mu_step_size * (avg_cons - args.mu_value)
@@ -1086,47 +1142,42 @@ def main():
             if ema is not None:
                 ema.restore(model, backup)
 
-            # Save best model
-            # Primary: xi_sum below threshold → feasible; secondary: lowest discrete objective per instance
-            curr_xi = val_metrics['xi_sum_per_sample']
-            curr_obj = val_metrics['disc_obj_per_inst']
-            curr_feasible = curr_xi < args.es_xi_threshold
+            curr_round_feas = val_metrics['round_n_feasible']
+            curr_round_obj = val_metrics['round_avg_obj']
+            curr_valid = val_metrics['n_valid_instances']
 
             is_best = False
-            if curr_feasible and not best_feasible:
-                # First time becoming feasible — always save
+            if curr_round_feas > best_round_feasible:
                 is_best = True
-            elif curr_feasible and best_feasible:
-                # Both feasible — save if objective improved
-                if curr_obj < best_val_obj - 1e-6:
-                    is_best = True
-            elif not curr_feasible and not best_feasible:
-                
-                # Neither feasible — save if xi_sum improved
-                if curr_xi < best_val_xi_sum - 1e-6:
+            elif curr_round_feas == best_round_feasible and curr_round_feas > 0:
+                if curr_round_obj < best_round_obj - 1e-6:
                     is_best = True
 
             if is_best:
-                best_feasible = curr_feasible
-                best_val_xi_sum = curr_xi
-                best_val_obj = curr_obj
+                best_round_feasible = curr_round_feas
+                best_round_obj = curr_round_obj
                 patience_counter = 0
                 save_state = ema.state_dict(model) if ema is not None else model.state_dict()
                 torch.save(save_state, os.path.join(model_save_path, f'{save_name}_model_best.pth'))
             else:
                 patience_counter += 1
 
-            # Save best all-feasible model:
-            # ALL validation instances feasible after discretization + best discrete objective
+            val_metrics['best_saved'] = is_best
+            val_metrics['best_round_feasible'] = best_round_feasible
+            val_metrics['best_round_obj'] = best_round_obj
+            val_metrics['n_valid_instances'] = curr_valid
+
+            # Extra current-project artifact: all validation instances feasible after discretization.
             n_infeas = val_metrics['n_infeasible_inst']
+            curr_all_obj = val_metrics['disc_obj_per_inst']
             if n_infeas == 0:
-                if curr_obj < best_allfeas_obj - 1e-6:
-                    best_allfeas_obj = curr_obj
+                if curr_all_obj < best_allfeas_obj - 1e-6:
+                    best_allfeas_obj = curr_all_obj
                     save_state = ema.state_dict(model) if ema is not None else model.state_dict()
                     af_path = os.path.join(model_save_path, f'{save_name}_model_best_allfeas.pth')
                     torch.save(save_state, af_path)
                     print(f"  [AllFeas] Saved best all-feasible model: "
-                          f"disc_obj/inst={curr_obj:.4f}, n_infeasible=0")
+                          f"disc_obj/inst={curr_all_obj:.4f}, n_infeasible=0")
 
         # Save latest (full checkpoint for resumable training)
         full_ckpt = {
@@ -1138,6 +1189,9 @@ def main():
             'tau': args.tau,
             'tau_obj': args.tau_obj,
             'loss_config': args.loss_config,
+            'lr_output': args.lr_output,
+            'lr_inner': args.lr_inner,
+            'lr_schedule': args.lr_schedule,
         }
         if scheduler is not None:
             full_ckpt['scheduler_state_dict'] = scheduler.state_dict()
@@ -1158,9 +1212,7 @@ def main():
                 and patience_counter >= args.patience
                 and epoch > args.patience):
             print(f"\nEarly stopping at epoch {epoch}: no improvement for {args.patience} epochs.")
-            print(f"  Best XiSum/sample={best_val_xi_sum:.6f}  "
-                  f"Best AvgObj/sample={best_val_obj:.4f}  "
-                  f"Feasible={best_feasible}")
+            print(f"  Best round_feasible={best_round_feasible}  Best round_avg_obj={best_round_obj:.4f}")
             break
 
     log_file.close()
